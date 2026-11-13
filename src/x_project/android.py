@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import threading
 import time
 import unicodedata
 import uuid
@@ -184,17 +185,22 @@ class Adb:
             raise DeviceError("连接到的手机与绑定设备不同，停止操作")
 
     def dump(self):
-        remote = f"/sdcard/x-project-{uuid.uuid4().hex}.xml"
-        try:
-            self.shell(["uiautomator", "dump", "--compressed", remote], timeout=18)
-            xml = self.run(["exec-out", "cat", remote])
-            _root(xml)
-            return xml
-        finally:
+        for attempt in range(3):
+            remote = f"/sdcard/x-project-{uuid.uuid4().hex}.xml"
             try:
-                self.shell(["rm", "-f", remote])
+                self.shell(["uiautomator", "dump", "--compressed", remote], timeout=18)
+                xml = self.run(["exec-out", "cat", remote])
+                _root(xml)
+                return xml
             except DeviceError:
-                pass
+                if attempt == 2:
+                    raise DeviceError("手机界面持续无法读取，请待界面稳定后重试") from None
+                time.sleep(.5)
+            finally:
+                try:
+                    self.shell(["rm", "-f", remote])
+                except DeviceError:
+                    pass
 
     def locked(self):
         policy = self.shell(["dumpsys", "window", "policy"])
@@ -281,6 +287,24 @@ class PhonePoster:
                 commands.append(f"input touchscreen motionevent MOVE {x} {y}")
         self.adb.run(["shell", "sh", "-s"], timeout=45, stdin="\n".join(commands)+"\n")
 
+    def _unlock_ui(self):
+        # Keyguard may override the normal screen timeout with a shorter one.
+        # Only wake signals run during this read; stop before drawing a pattern.
+        stop = threading.Event()
+        def pulse():
+            while not stop.wait(2):
+                try:
+                    self.adb.shell(["input", "keyevent", "224"], timeout=5)
+                except DeviceError:
+                    return
+        worker = threading.Thread(target=pulse, daemon=True)
+        worker.start()
+        try:
+            return _root(self.adb.dump())
+        finally:
+            stop.set()
+            worker.join()
+
     def unlock(self):
         if not self.adb.locked():
             return
@@ -298,15 +322,15 @@ class PhonePoster:
         time.sleep(0.4)
         if not self.adb.locked():
             return
-        ui = _root(self.adb.dump())
+        ui = self._unlock_ui()
         if self.unlock_method == "pattern":
             bounds = self._pattern_bounds(ui)
             if bounds is None:
-                self.adb.shell(["input", "swipe", str(width//2), str(height-8), str(width//2), str(height//4), "400"])
+                self.adb.shell(["input", "swipe", str(width//2), str(height*85//100), str(width//2), str(height//4), "400"])
                 time.sleep(.5)
                 if not self.adb.locked():
                     return
-                bounds = self._pattern_bounds(_root(self.adb.dump()))
+                bounds = self._pattern_bounds(self._unlock_ui())
             if bounds is None or not (0 <= bounds[0] < bounds[2] <= width and 0 <= bounds[1] < bounds[3] <= height):
                 raise DeviceError("未确认系统图案区域，不输入图案")
             marker.write_text("核对手机后手动运行 unlock-reset。\n")
@@ -346,11 +370,13 @@ class PhonePoster:
         was_on = self.adb.screen_on()
         timeout = self.adb.shell(["settings", "get", "system", "screen_off_timeout"]).strip()
         try:
+            # Unlock may need multiple slow accessibility snapshots. Keep the
+            # screen awake through that work too, then restore on every exit.
+            self.adb.shell(["settings", "put", "system", "screen_off_timeout", "180000"])
             if not was_on:
                 self.adb.shell(["input", "keyevent", "224"])
                 time.sleep(1.2)
             self.unlock()
-            self.adb.shell(["settings", "put", "system", "screen_off_timeout", "180000"])
             yield self
         finally:
             try:

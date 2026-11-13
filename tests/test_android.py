@@ -249,3 +249,76 @@ class AndroidTest(unittest.TestCase):
             with patch("x_project.android.time.sleep") as sleep:
                 with self.assertRaises(DeviceError):poster.prepare("你好，AI。\n第二行")
             self.assertEqual(phone.calls,1);sleep.assert_not_called()
+
+    def test_dump_retries_when_uiautomator_did_not_create_its_file(self):
+        from x_project.android import Adb
+        from unittest.mock import patch
+        a=Adb("adb","phone","bound");reads=["cat: no such file", "<hierarchy/>"]
+        with patch.object(a,"shell",return_value=""),patch.object(a,"run",side_effect=reads) as run,patch("x_project.android.time.sleep"):
+            self.assertEqual(a.dump(),"<hierarchy/>")
+            self.assertEqual(run.call_count,2)
+
+    def test_dump_transient_errors_are_bounded(self):
+        from x_project.android import Adb
+        from unittest.mock import patch
+        a=Adb("adb","phone","bound")
+        with patch.object(a,"shell",return_value=""),patch.object(a,"run",return_value="cat: no such file") as run,patch("x_project.android.time.sleep"):
+            with self.assertRaises(DeviceError):a.dump()
+            self.assertEqual(run.call_count,3)
+
+    def test_session_extends_timeout_before_unlock_so_ui_dump_cannot_put_phone_to_sleep(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            def __init__(self):self.actions=[]
+            def check(self):pass
+            def screen_on(self):return False
+            def shell(self,args):self.actions.append(args);return "30000"
+        with tempfile.TemporaryDirectory() as d:
+            phone=Phone();poster=PhonePoster(phone,"tester",Path(d)/".env",d)
+            def unlock():self.assertIn(["settings","put","system","screen_off_timeout","180000"],phone.actions)
+            with patch.object(poster,"unlock",side_effect=unlock),patch("x_project.android.time.sleep"):
+                with poster.session():pass
+            self.assertEqual(phone.actions[-1],["input","keyevent","223"])
+            self.assertIn(["settings","put","system","screen_off_timeout","30000"],phone.actions)
+
+    def test_lock_screen_swipe_starts_above_the_system_gesture_bar(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="bound"
+            def __init__(self):self.actions=[];self.entered=False;self.reads=0
+            def locked(self):return not self.entered
+            def shell(self,args,**kw):self.actions.append(args);return "1080x2376"
+            def dump(self):
+                self.reads+=1
+                if self.reads==1:return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/keyguard_long_press"/></hierarchy>'
+                return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
+            def run(self,*args,**kw):self.entered=True
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            phone=Phone();poster=PhonePoster(phone,"tester",env,root/"state",True,"pattern")
+            with patch("x_project.android.time.sleep"):poster.unlock()
+            swipe=next(a for a in phone.actions if a[:2]==["input","swipe"])
+            self.assertEqual(int(swipe[3]),2376*85//100)
+
+    def test_lock_ui_read_keeps_screen_awake_until_snapshot_finishes(self):
+        import tempfile,threading
+        from pathlib import Path
+        from x_project.android import PhonePoster
+        wake=threading.Event()
+        class Phone:
+            def shell(self,args,**kw):
+                if args==["input","keyevent","224"]:wake.set()
+                return ""
+            def dump(self):
+                if not wake.wait(4):raise DeviceError("screen timed out before snapshot")
+                return '<hierarchy/>'
+        with tempfile.TemporaryDirectory() as d:
+            poster=PhonePoster(Phone(),"tester",Path(d)/".env",d)
+            self.assertEqual(poster._unlock_ui().tag,"hierarchy")
+            self.assertTrue(wake.is_set())

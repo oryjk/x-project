@@ -35,11 +35,13 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(recovered.get(row["id"])["status"], "unknown")
         self.assertIsNone(recovered.claim(self.now.replace(minute=20)))
 
-    def test_pre_submit_block_keeps_post_but_consumes_slot(self):
+    def test_pre_submit_failure_releases_reservation_without_counting_a_post(self):
         self.store.enqueue(draft(), self.now); row = self.store.claim(self.now)
         self.store.defer(row["id"], "device locked")
         self.assertEqual(self.store.get(row["id"])["status"], "queued")
-        self.assertIsNone(self.store.claim(self.now))
+        retry=self.store.claim(self.now)
+        self.assertEqual(retry["id"],row["id"])
+        self.store.defer(retry["id"],"still offline")
         self.assertEqual(self.store.claim(self.now.replace(minute=20))["id"], row["id"])
 
     def test_actual_submission_clock_enforces_gap_after_slow_preparation(self):
@@ -80,3 +82,11 @@ class StoreTest(unittest.TestCase):
         self.store.enqueue(draft(),self.now);row=self.store.claim(self.now.replace(minute=57))
         with self.assertRaises(ContentError):
             self.store.submitting(row["id"],self.now.replace(hour=self.now.hour+1),due_at=self.now.replace(minute=57).timestamp())
+
+    def test_three_pre_submit_failures_do_not_exhaust_the_actual_hourly_post_quota(self):
+        self.store.enqueue(draft(),self.now)
+        for minute in (0,10,20):
+            row=self.store.claim(self.now.replace(minute=minute))
+            self.assertIsNotNone(row)
+            self.store.defer(row["id"],"no irreversible tap")
+        self.assertIsNotNone(self.store.claim(self.now.replace(minute=30)))

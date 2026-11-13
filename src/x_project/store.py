@@ -142,7 +142,13 @@ class Store:
 
     def defer(self, post_id, reason):
         with self.connection() as db:
-            db.execute("UPDATE posts SET status='queued',note=? WHERE id=? AND status='prepared'", (reason, post_id))
+            result = db.execute("UPDATE posts SET status='queued',note=? WHERE id=? AND status='prepared'", (reason, post_id))
+            # A verified pre-submit failure never used the irreversible tap.
+            # Release its reservation; actual/uncertain submissions retain both
+            # their timestamp and quota, including after manual resolution.
+            if result.rowcount:
+                db.execute("DELETE FROM slots WHERE post_id=? AND EXISTS "
+                           "(SELECT 1 FROM posts WHERE id=? AND submitted_at IS NULL)", (post_id, post_id))
 
     def reject(self, post_id, reason):
         with self.connection() as db:
