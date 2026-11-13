@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -176,16 +177,47 @@ def output_schema(count):
     return {"type": "object", "additionalProperties": False, "properties": {"items": {"type": "array", "maxItems": count, "items": draft}}, "required": ["items"]}
 
 
+def program_read_roots(executable, protected):
+    """Grant only the actual executable and recognized installation resources."""
+    located = shutil.which(executable)
+    if not located:
+        raise ContentError('Codex 不可用，请检查 X_CODEX_PATH 或 PATH')
+    binary = Path(located).resolve()
+    roots = [binary]
+    # Standalone releases keep runtime helpers alongside the binary in bin/.
+    if binary.parent.name == 'bin':
+        roots.append(binary.parent)
+    # npm's launcher reads its own package and optional platform-native packages.
+    package = binary.parent.parent
+    manifest = package / 'package.json'
+    if binary.parent.name == 'bin' and manifest.exists():
+        try:
+            official = json.loads(manifest.read_text()).get('name') == '@openai/codex'
+        except (ValueError, OSError):
+            official = False
+        if official:
+            roots.append(package)
+            if package.parent.name == '@openai':
+                roots.extend(p for p in package.parent.glob('codex-*') if p.is_dir())
+    resolved = {p.resolve() for p in roots}
+    if any(root.is_dir() and any(project == root or project.is_relative_to(root) for project in protected)
+           for root in resolved):
+        raise ContentError('Codex 程序目录不能包含项目凭据目录')
+    return sorted(resolved)
+
+
 class CodexResearcher:
-    def __init__(self, executable="codex", audit_dir=None):
+    def __init__(self, executable="codex", audit_dir=None, project_root=None):
         self.executable = executable
         self.audit_dir = Path(audit_dir) if audit_dir else None
+        self.project_root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parents[2]
 
     def generate(self, count, history, persona):
         report = {"at": utcnow().isoformat(), "searches": 0, "opened_pages": 0, "status": "interrupted"}
         try:
             drafts = self._generate(count, history, persona, report)
-            report.update(status="completed" if drafts else "no-news", generated=len(drafts))
+            report.update(status="completed" if drafts else "no-news", generated=len(drafts),
+                          source_verification="required" if drafts else "not-applicable")
             return drafts
         except ContentError as error:
             report.update(status="failed", reason=str(error))
@@ -230,11 +262,15 @@ source published_at 最多7天；主要新闻优先48小时。每条总长度（
                 codex += ["--disable", feature]
             codex += ["exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never", "--output-schema", str(schema), "--output-last-message", str(output), "--cd", str(root), "-"]
             auth_root = Path(os.environ.get("CODEX_HOME", Path.home()/".codex")).resolve()
-            project = Path(__file__).resolve().parents[2]
-            if auth_root == project or project.is_relative_to(auth_root):
+            protected = {self.project_root, Path(__file__).resolve().parents[2]}
+            if any(auth_root == project or project.is_relative_to(auth_root) for project in protected):
                 raise ContentError("研究认证目录不能包含项目凭据目录")
             wrapper = Path(__file__).with_name("isolation.py")
-            args = [sys.executable, str(wrapper), "--read-root", str(root), "--read-root", str(auth_root), "--", *codex]
+            read_roots = [root, auth_root, *program_read_roots(self.executable, protected)]
+            args = [sys.executable, str(wrapper)]
+            for read_root in read_roots:
+                args += ['--read-root', str(read_root)]
+            args += ['--', *codex]
             allowed = {"HOME", "PATH", "LANG", "LC_ALL", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"}
             env = {k: v for k, v in os.environ.items() if k in allowed}
             env["CODEX_HOME"] = str(auth_root)
@@ -275,6 +311,8 @@ source published_at 最多7天；主要新闻优先48小时。每条总长度（
                 drafts = [Draft.from_dict(item) for item in data["items"]]
             except (ValueError, KeyError, TypeError):
                 raise ContentError("生成结果结构、来源时间或长度不合格") from None
-            if drafts and not opens:
-                raise ContentError("研究进程没有实际打开来源原文，停止采用结果")
+            # These are untrusted candidates. The pipeline independently fetches
+            # EVERY cited original and checks date + verbatim evidence before
+            # enqueueing. A model-level open action is neither necessary nor
+            # sufficient proof that all candidate sources were actually read.
             return drafts

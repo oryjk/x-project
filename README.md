@@ -10,12 +10,47 @@
 
 需要 Linux（启用 Landlock）、Python 3.11+、ADB，以及已登录且支持网页搜索的 Codex CLI。Python 部分没有第三方必装依赖。
 
+下载或克隆项目后，只需配置 `.env`，不必创建 `config.toml`。以下命令在项目根目录执行；目录可放在任意位置：
+
 ```bash
-cd /home/betalpha/projects/x-project
+cd x-project
+rtk cp .env.example .env
+rtk chmod 600 .env
+# 在本机编辑 .env，填写账号、ADB 路径和无线调试地址/端口
+```
+
+在手机上打开无线调试的“使用配对码配对设备”，将弹窗中的配对端口、六位配对码填到 `.env`，保持弹窗打开再执行：
+
+```bash
+# 首次配对；已经配对的设备可跳过
+rtk python3 x.py pair
+# 连接手机并显示物理设备序列号；请核对后填入 .env 的 X_DEVICE_ID
+rtk python3 x.py connect
+# 填好 X_DEVICE_ID 及所需的锁屏设置后，检查部署
 rtk python3 x.py doctor
+# 明确启用正式发布
 rtk python3 x.py enable --publish
 rtk python3 x.py status
 ```
+
+配对完成后可清空 `X_ADB_PAIR_CODE`；定时任务不使用也不保存该临时码。连接端口取自无线调试主页面，配对端口取自配对弹窗，两者通常不同。USB 连接可改用 `X_ADB_SERIAL`，无需填写无线地址或配对信息。
+
+系统环境变量优先于 `.env`，其次是可选的旧 `config.toml`，最后使用默认值。项目目录由程序入口确定，从其他工作目录运行也无需改路径；`--root` 可显式选择配置目录。`.env` 自动读取，不需要 `source`，不会执行变量插值。默认关闭自动解锁和自动发布。
+
+常用配置：
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `X_ACCOUNT` | 自己的 X 用户名 |
+| `X_ADB_PATH` / `X_CODEX_PATH` | 程序名或部署机器上的绝对路径，默认 `adb` / `codex` |
+| `X_ADB_HOST` / `X_ADB_PORT` | 无线调试连接地址和端口 |
+| `X_ADB_SERIAL` | 完整连接地址或 USB 序列号；替代 HOST/PORT |
+| `X_ADB_PAIR_HOST` / `X_ADB_PAIR_PORT` / `X_ADB_PAIR_CODE` | 首次配对地址、端口和临时六位配对码 |
+| `X_DEVICE_ID` | 经人工核对的物理设备序列号 |
+| `X_ALLOW_UNLOCK` / `X_UNLOCK_METHOD` | 是否允许解锁，以及 `pin` / `pattern` |
+| `X_PHONE_PIN` / `X_PHONE_PATTERN` | 对应方式的锁屏凭据，只填一种 |
+| `X_PERSONA` | 可选的中文整理口吻 |
+| `CODEX_HOME`、代理环境变量 | 可选的登录目录与网络设置 |
 
 手动文案支持 UTF-8 文件、中文及换行：
 
@@ -28,9 +63,9 @@ rtk python3 x.py post --file post.txt --publish
 
 ## 手机与密码
 
-复制 `config.example.toml` 为本机 `config.toml`，配置无线调试连接地址、设备序列号及 X 用户名。设备序列号取自 `adb -s IP:PORT shell getprop ro.serialno`，地址变化后也必须匹配同一设备身份，防止连错手机。
+`.env.example` 包含完整配置说明。已有的 `config.toml` 仍兼容，但新部署无需复制它。ADB 默认从 `PATH` 查找，也可在 `X_ADB_PATH` 填写绝对路径；Codex 同理。`connect` 显示的物理序列号对应 `adb shell getprop ro.serialno`，连接地址变化后也必须匹配同一设备身份，防止连错手机。
 
-通过 `unlock_method` 明确选择 `pin` 或 `pattern`。本机 `.env` 的 PIN 使用 `X_PHONE_PIN=...`（4–16 位数字）；图案使用 `X_PHONE_PATTERN=...`（4–9 个不重复点位）。两种方式均兼容 `pwd=...`。图案九宫格从左到右、从上到下编号 1–9，保存实际连线经过的点位顺序；不要发送到聊天。文件权限必须为 `0600`，不执行 shell 插值。`.env`、`config.toml`、`.state/` 已忽略，密码不传给内容生成进程，不进入命令行或日志。
+通过 `X_UNLOCK_METHOD` 明确选择 `pin` 或 `pattern`，并在需要自动解锁时设置 `X_ALLOW_UNLOCK=true`。本机 `.env` 或系统环境变量的 PIN 使用 `X_PHONE_PIN=...`（4–16 位数字）；图案使用 `X_PHONE_PATTERN=...`（4–9 个不重复点位）。两种方式均兼容 `pwd=...`。图案九宫格从左到右、从上到下编号 1–9，保存实际连线经过的点位顺序；不要发送到聊天。文件权限必须为 `0600`，不执行 shell 插值。`.env`、`config.toml`、`.state/` 已忽略，密码和配对码不传给内容生成进程，不进入命令行或日志。
 
 ```bash
 rtk chmod 600 .env
@@ -56,7 +91,9 @@ rtk python3 x.py disable
 
 安装用户级 `x-project.timer`，每分钟检查持久化随机计划，到期时才检索、整理并发送一条。未到期只检查计划，每个时段进行一次研究（最多3个候选、仅采用1条）；研究提前完成但实际8分钟发送间隔不足时，在本窗口内等待，并持续检查取消，不会每分钟调用模型；存在未核对的 unknown 提交时停止采集和发布。查看记录：`.state/events.jsonl`；检索次数及状态：`.state/last-research.json`，核验拒绝原因：`.state/last-collect.json`；查看队列：`x.py queue`。
 
-无线调试重启后端口可能变化；用 `adb pair` / `adb connect` 重新连接并更新本机配置。电脑必须运行，手机须可达，账号保持登录。用户级任务是否能在退出登录后继续运行取决于宿主机的 user manager/linger 设置。
+启停开关保存在 `.state/`，无需改写 `.env` 或 `config.toml`；`disable` 的持久化停止状态优先于配置中的发布标志。定时服务保留启用时的 `PATH`、Codex 登录目录、代理和已导出的项目变量；导出的锁屏凭据保存在权限为 `0600` 的本机运行文件中，不含临时配对码。`.env` 在每次执行时重新读取；如修改了已导出的环境变量或安装路径，请重新执行 `enable` 更新服务。
+
+无线调试重启后端口可能变化；更新 `.env` 的连接端口后运行 `connect`，只有配对失效时才重新填写临时配对信息并运行 `pair`。电脑必须运行，手机须可达，账号保持登录。用户级任务是否能在退出登录后继续运行取决于宿主机的 user manager/linger 设置。
 
 文章读取保留原始URL（含路径末尾斜杠），仅去重使用规范化URL；核对标准发布时间元数据、GitHub relative-time 或新闻稿明确标注的发布日期，不能用版权年份代替。
 
@@ -70,7 +107,7 @@ rtk python3 x.py resolve --id 1 --not-sent
 
 ## 内容与视频
 
-实时检索使用已有 Codex 登录的非交互、网页搜索和结构化输出，模型只负责研究与写作，不能控制发布。研究子进程通过 Linux Landlock 文件读取白名单，项目文件及 `.env` 不在可读范围；单元测试在真实受限子进程中验证模拟秘密文件无法读取。只提供系统运行库、研究临时目录及必要的 Codex 认证/程序目录，环境变量采用白名单，禁用模型 shell、浏览器控制、插件与子代理，关闭共享 daemon。隔离不可用时停止生成，不降级为不受限模式。搜索所依赖的 Code Mode host 必须启用，但不会开放模型本地 shell 或手机控制。读取 JSON 执行事件核对实际搜索/原文打开；工具错误、没有实际检索都明确报告 research-unavailable，不再当作无新闻。调用消耗当前模型账户的使用额度。
+实时检索使用已有 Codex 登录的非交互、网页搜索和结构化输出，模型只负责研究与写作，不能控制发布。研究子进程通过 Linux Landlock 文件读取白名单，项目文件及 `.env` 不在可读范围；单元测试在真实受限子进程中验证模拟秘密文件无法读取。只提供系统运行库、研究临时目录及必要的 Codex 认证/程序目录，环境变量采用白名单，禁用模型 shell、浏览器控制、插件与子代理，关闭共享 daemon。隔离不可用时停止生成，不降级为不受限模式。搜索所依赖的 Code Mode host 必须启用，但不会开放模型本地 shell 或手机控制。读取 JSON 执行事件核对实际搜索并记录模型原文打开次数；候选必须再由程序逐个抓取所有引用原文，独立核对发布日期和逐字证据后才能入库。模型没有执行打开动作不会直接丢弃整个研究批次，原文抓取或核验失败的候选仍拒绝采用。工具错误、没有实际检索都明确报告 research-unavailable，不再当作无新闻。调用消耗当前模型账户的使用额度。
 
 候选优先近期原始公告、论文、开源发布和作者原帖。每条保存可逐字核对的短证据；正文表达事实、自己的判断及实际意义，不冒充亲测或虚构履历。核对来源链接、可读证据、原始发布日期、时效和长度，再按来源/事件/正文去重。X 原帖日期独立按 status ID 核对，YouTube 与文章核对原始发布时间元数据；无法证明日期则不作为近期新闻。仅有日期时保持日期粒度，不编造具体发布时间。过期/不合格草稿退休，不会永久堵塞队首。
 

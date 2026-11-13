@@ -15,13 +15,15 @@ class CliTest(unittest.TestCase):
         if not shutil.which("systemd-analyze"):
             self.skipTest("systemd not installed")
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root/"config.toml").write_text("publish_enabled = false\n")
+            root = Path(directory) / 'download path %'; root.mkdir()
+            (root/"config.toml").write_text("publish_enabled = false\n")
             config = Config(root, "tester", "adb", "test", False, False, "AI", "bound")
             with patch("x_project.cli.Path.home", return_value=root), patch("x_project.cli._systemctl", return_value="active"):
                 install_timer(config, False)
             units = root/".config"/"systemd"/"user"
             run = subprocess.run(["systemd-analyze", "--user", "verify", str(units/"x-project.service"), str(units/"x-project.timer")], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertNotIn('ignoring', run.stderr.lower())
 
     def test_stop_persists_cancellation_even_while_an_inflight_worker_holds_the_lock(self):
         with tempfile.TemporaryDirectory() as directory:

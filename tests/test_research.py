@@ -1,3 +1,4 @@
+import sys
 import unittest
 from unittest.mock import patch
 from x_project.content import ContentError
@@ -61,7 +62,86 @@ class ResearchTest(unittest.TestCase):
 
 
 class ResearchRuntimeTest(unittest.TestCase):
-    def invoke(self, events, stderr="", returncode=0):
+    def test_custom_codex_installation_runs_inside_real_isolation(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from x_project.research import CodexResearcher
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'custom-tools' / 'codex'
+            executable.parent.mkdir()
+            (executable.parent / 'phone.env').write_text('synthetic-private-value')
+            executable.write_text('''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+try:
+    Path(__file__).with_name('phone.env').read_text()
+except PermissionError:
+    pass
+else:
+    raise SystemExit(5)
+assert 'X_PHONE_PIN' not in __import__('os').environ
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('{"items":[]}')
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'web_search', 'action': {'type': 'search'}}}))
+''')
+            executable.chmod(0o700)
+            self.assertEqual(CodexResearcher(executable=str(executable), audit_dir=root / 'audit').generate(1, [], '中文'), [])
+
+    def test_auth_directory_cannot_contain_alternate_configuration_root(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from x_project.research import CodexResearcher
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'alternate-config'; project.mkdir()
+            with patch.dict(os.environ, {'CODEX_HOME': str(root)}):
+                with self.assertRaisesRegex(ContentError, '认证目录'):
+                    CodexResearcher(project_root=project).generate(1, [], '中文')
+
+    def test_npm_style_installation_can_read_its_package_and_native_resources(self):
+        import tempfile
+        from pathlib import Path
+        from x_project.research import CodexResearcher
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'node_modules' / '@openai' / 'codex'
+            (package / 'bin').mkdir(parents=True)
+            (package / 'package.json').write_text('{"name":"@openai/codex"}')
+            native = package.parent / 'codex-linux-x64'
+            native.mkdir(); (native / 'native-resource').write_text('native-code')
+            executable = package / 'bin' / 'codex'
+            executable.write_text('''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+package = Path(__file__).resolve().parent.parent
+assert json.loads((package / 'package.json').read_text())['name'] == '@openai/codex'
+assert (package.parent / 'codex-linux-x64' / 'native-resource').read_text() == 'native-code'
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('{"items":[]}')
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'web_search', 'action': {'type': 'search'}}}))
+''')
+            executable.chmod(0o700)
+            self.assertEqual(CodexResearcher(executable=str(executable)).generate(1, [], '中文'), [])
+
+    def test_research_process_does_not_inherit_phone_configuration_or_credentials(self):
+        import os
+        import json
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from x_project.research import CodexResearcher
+        phone = {'X_PHONE_PIN': '123456', 'X_PHONE_PATTERN': '12589', 'X_ADB_PAIR_CODE': '654321', 'X_ADB_HOST': '192.0.2.5', 'pwd': '123456'}
+        captured = {}
+        def run(args, **kwargs):
+            captured.update(kwargs['env'])
+            Path(args[args.index('--output-last-message') + 1]).write_text('{"items":[]}')
+            return SimpleNamespace(returncode=0, stdout=json.dumps({'type': 'item.completed', 'item': {'type': 'web_search', 'action': {'type': 'search'}}}), stderr='')
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, phone), patch('x_project.research.subprocess.run', side_effect=run):
+            CodexResearcher(executable=sys.executable, audit_dir=directory).generate(1, [], '中文')
+        self.assertTrue(set(phone).isdisjoint(captured))
+
+    def invoke(self, events, stderr="", returncode=0, items=None):
         import json,tempfile
         from pathlib import Path
         from types import SimpleNamespace
@@ -70,10 +150,10 @@ class ResearchRuntimeTest(unittest.TestCase):
             def run(args,**kw):
                 self.command=args
                 output=Path(args[args.index("--output-last-message")+1])
-                output.write_text('{"items":[]}')
+                output.write_text(json.dumps({"items":items or []}))
                 return SimpleNamespace(returncode=returncode,stdout="\n".join(json.dumps(e) for e in events),stderr=stderr)
             with patch("x_project.research.subprocess.run",side_effect=run):
-                result=CodexResearcher(audit_dir=directory).generate(1,[],"中文")
+                result=CodexResearcher(executable=sys.executable,audit_dir=directory).generate(1,[],"中文")
             report=Path(directory)/"last-research.json"
             self.report=json.loads(report.read_text()) if report.exists() else {}
             return result
@@ -102,7 +182,7 @@ class ResearchRuntimeTest(unittest.TestCase):
         event=json.dumps({"type":"item.completed","item":{"type":"web_search","action":{"type":"search"}}})
         with tempfile.TemporaryDirectory() as d:
             with patch("x_project.research.subprocess.run",return_value=SimpleNamespace(returncode=1,stdout=event,stderr="")):
-                with self.assertRaises(ContentError):CodexResearcher(audit_dir=d).generate(1,[],"中文")
+                with self.assertRaises(ContentError):CodexResearcher(executable=sys.executable,audit_dir=d).generate(1,[],"中文")
             report=json.loads((Path(d)/"last-research.json").read_text())
             self.assertEqual(report["status"],"failed")
             self.assertTrue(report["reason"])
@@ -114,7 +194,14 @@ class ResearchRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/"last-research.json";path.write_text('{"at":"old","status":"searched"}')
             with patch("x_project.research.subprocess.run",side_effect=subprocess.TimeoutExpired("test",1)):
-                with self.assertRaises(ContentError):CodexResearcher(audit_dir=d).generate(1,[],"中文")
+                with self.assertRaises(ContentError):CodexResearcher(executable=sys.executable,audit_dir=d).generate(1,[],"中文")
             report=json.loads(path.read_text())
             self.assertEqual(report["status"],"failed")
             self.assertNotEqual(report["at"],"old")
+
+    def test_search_only_result_remains_a_candidate_requiring_independent_source_verification(self):
+        events=[{"type":"item.completed","item":{"type":"web_search","action":{"type":"search"}}}]
+        items=self.invoke(events,items=[draft().to_dict()])
+        self.assertEqual(len(items),1)
+        self.assertEqual(self.report["opened_pages"],0)
+        self.assertEqual(self.report["source_verification"],"required")

@@ -1,5 +1,5 @@
 account = "your_x_handle"
-adb = "/home/betalpha/Android/Sdk/platform-tools/adb"
+adb = "adb"
 serial = "PHONE_IP:WIRELESS_DEBUG_PORT"
 device_id = "ADB_GETPROP_RO_SERIALNO"
 allow_unlock = true

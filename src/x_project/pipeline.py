@@ -1,17 +1,15 @@
 """Orchestration: independent model, state and device boundaries."""
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 from pathlib import Path
-import re
-import tomllib
 import time
 import uuid
 
 from .android import Adb, DeviceError, PhonePoster
+from .config import Config
 from .content import ContentError, Draft, timestamp, utcnow, validate_draft, weighted_length
 from .research import CodexResearcher, SourceVerifier
 from .schedule import Schedule
@@ -28,31 +26,6 @@ def cancel_inflight(config):
 def cancellation_version(config):
     marker = config.state/"cancel-version"
     return marker.read_text() if marker.exists() else ""
-
-
-@dataclass
-class Config:
-    root: Path
-    account: str
-    adb: str
-    serial: str
-    allow_unlock: bool
-    publish_enabled: bool
-    persona: str
-    device_id: str = ""
-    unlock_method: str = "pin"
-
-    @classmethod
-    def load(cls, root):
-        root = Path(root).resolve()
-        values = tomllib.loads((root/"config.toml").read_text())
-        if not re.fullmatch(r"@?[A-Za-z0-9_]{1,15}", values["account"]):
-            raise ValueError("config.toml 的 account 不是有效 X 用户名")
-        return cls(root=root, **values)
-
-    @property
-    def state(self):
-        p = self.root/".state"; p.mkdir(mode=0o700, parents=True, exist_ok=True); return p
 
 
 @contextmanager
@@ -74,7 +47,7 @@ class Pipeline:
         self.cancel_version = cancellation_version(config)
         self.store = Store(config.state/"queue.sqlite3")
         self.schedule = Schedule(config.state/"schedule.sqlite3")
-        self.researcher = researcher or CodexResearcher(audit_dir=config.state)
+        self.researcher = researcher or CodexResearcher(executable=config.codex, audit_dir=config.state, project_root=config.root)
         self.verifier = verifier or SourceVerifier()
         self.poster = poster or PhonePoster(Adb(config.adb, config.serial, config.device_id), config.account,
                                           config.root/".env", config.state, config.allow_unlock, config.unlock_method)
@@ -82,11 +55,12 @@ class Pipeline:
     def collect(self, count=3, enqueue_limit=None):
         history = [{"topic": row["topic"], "sources": json.loads(row["draft"])["sources"]} for row in self.store.rows(90)]
         generated = self.researcher.generate(count, history, self.config.persona)
-        accepted_ids = []; rejected = []
+        accepted_ids = []; rejected = []; verified_sources = 0
         for draft in generated:
             try:
                 validate_draft(draft)
                 self.verifier.verify(draft)
+                verified_sources += len(draft.sources)
                 post_id = self.store.enqueue(draft)
                 if post_id:
                     accepted_ids.append(post_id)
@@ -98,7 +72,8 @@ class Pipeline:
                 # Reasons are content-only; never include subprocess environments or credentials.
                 import sys
                 rejected.append({"topic": draft.topic, "reason": str(sys.exception())})
-        report = {"generated": len(generated), "accepted": len(accepted_ids), "accepted_ids": accepted_ids, "rejected": rejected}
+        report = {"generated": len(generated), "accepted": len(accepted_ids), "accepted_ids": accepted_ids,
+                  "verified_sources": verified_sources, "rejected": rejected}
         (self.config.state/"last-collect.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         return report
 

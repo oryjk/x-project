@@ -189,3 +189,21 @@ class PipelineTest(unittest.TestCase):
         p.clock=lambda:ready;p.sleep=lambda seconds:cancel_inflight(self.config)
         self.assertEqual(p.tick(True,datetime.fromtimestamp(due,timezone.utc))["status"],"cancelled")
         self.assertEqual(p.poster.calls,0)
+
+    def test_search_candidates_cannot_bypass_real_source_content_and_date_checks(self):
+        from unittest.mock import Mock,patch
+        from x_project.research import SourceVerifier
+        fresh=draft();fresh.sources[0].published_at=self.now.isoformat()
+        researcher=Mock();researcher.generate.return_value=[fresh]
+        p=Pipeline(self.config,researcher=researcher,verifier=SourceVerifier(),poster=Poster())
+        page=f'<meta property="article:published_time" content="{self.now.isoformat()}"><p>Unrelated content</p>'
+        with patch("x_project.research.fetch",return_value=page):
+            report=p.collect(3,enqueue_limit=1)
+        self.assertEqual(report["accepted"],0)
+        self.assertEqual(p.store.queued_count(),0)
+        self.assertIn("短证据",report["rejected"][0]["reason"])
+        page=f'<meta property="article:published_time" content="{self.now.isoformat()}"><p>Release evidence from the original announcement.</p>'
+        with patch("x_project.research.fetch",return_value=page):
+            report=p.collect(3,enqueue_limit=1)
+        self.assertEqual(report["accepted"],1)
+        self.assertEqual(report["verified_sources"],1)
