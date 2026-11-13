@@ -185,7 +185,8 @@ class CodexResearcher:
         report = {"at": utcnow().isoformat(), "searches": 0, "opened_pages": 0, "status": "interrupted"}
         try:
             drafts = self._generate(count, history, persona, report)
-            report.update(status="completed" if drafts else "no-news", generated=len(drafts))
+            report.update(status="completed" if drafts else "no-news", generated=len(drafts),
+                          source_verification="required" if drafts else "not-applicable")
             return drafts
         except ContentError as error:
             report.update(status="failed", reason=str(error))
@@ -275,6 +276,8 @@ source published_at 最多7天；主要新闻优先48小时。每条总长度（
                 drafts = [Draft.from_dict(item) for item in data["items"]]
             except (ValueError, KeyError, TypeError):
                 raise ContentError("生成结果结构、来源时间或长度不合格") from None
-            if drafts and not opens:
-                raise ContentError("研究进程没有实际打开来源原文，停止采用结果")
+            # These are untrusted candidates. The pipeline independently fetches
+            # EVERY cited original and checks date + verbatim evidence before
+            # enqueueing. A model-level open action is neither necessary nor
+            # sufficient proof that all candidate sources were actually read.
             return drafts

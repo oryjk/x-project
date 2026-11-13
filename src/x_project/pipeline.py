@@ -82,11 +82,12 @@ class Pipeline:
     def collect(self, count=3, enqueue_limit=None):
         history = [{"topic": row["topic"], "sources": json.loads(row["draft"])["sources"]} for row in self.store.rows(90)]
         generated = self.researcher.generate(count, history, self.config.persona)
-        accepted_ids = []; rejected = []
+        accepted_ids = []; rejected = []; verified_sources = 0
         for draft in generated:
             try:
                 validate_draft(draft)
                 self.verifier.verify(draft)
+                verified_sources += len(draft.sources)
                 post_id = self.store.enqueue(draft)
                 if post_id:
                     accepted_ids.append(post_id)
@@ -98,7 +99,8 @@ class Pipeline:
                 # Reasons are content-only; never include subprocess environments or credentials.
                 import sys
                 rejected.append({"topic": draft.topic, "reason": str(sys.exception())})
-        report = {"generated": len(generated), "accepted": len(accepted_ids), "accepted_ids": accepted_ids, "rejected": rejected}
+        report = {"generated": len(generated), "accepted": len(accepted_ids), "accepted_ids": accepted_ids,
+                  "verified_sources": verified_sources, "rejected": rejected}
         (self.config.state/"last-collect.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         return report
 

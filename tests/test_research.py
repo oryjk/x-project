@@ -61,7 +61,7 @@ class ResearchTest(unittest.TestCase):
 
 
 class ResearchRuntimeTest(unittest.TestCase):
-    def invoke(self, events, stderr="", returncode=0):
+    def invoke(self, events, stderr="", returncode=0, items=None):
         import json,tempfile
         from pathlib import Path
         from types import SimpleNamespace
@@ -70,7 +70,7 @@ class ResearchRuntimeTest(unittest.TestCase):
             def run(args,**kw):
                 self.command=args
                 output=Path(args[args.index("--output-last-message")+1])
-                output.write_text('{"items":[]}')
+                output.write_text(json.dumps({"items":items or []}))
                 return SimpleNamespace(returncode=returncode,stdout="\n".join(json.dumps(e) for e in events),stderr=stderr)
             with patch("x_project.research.subprocess.run",side_effect=run):
                 result=CodexResearcher(audit_dir=directory).generate(1,[],"中文")
@@ -118,3 +118,10 @@ class ResearchRuntimeTest(unittest.TestCase):
             report=json.loads(path.read_text())
             self.assertEqual(report["status"],"failed")
             self.assertNotEqual(report["at"],"old")
+
+    def test_search_only_result_remains_a_candidate_requiring_independent_source_verification(self):
+        events=[{"type":"item.completed","item":{"type":"web_search","action":{"type":"search"}}}]
+        items=self.invoke(events,items=[draft().to_dict()])
+        self.assertEqual(len(items),1)
+        self.assertEqual(self.report["opened_pages"],0)
+        self.assertEqual(self.report["source_verification"],"required")
