@@ -83,7 +83,9 @@ WantedBy=timers.target
     config_file.write_text(re.sub(r"(?m)^publish_enabled\s*=.*$", f"publish_enabled = {'true' if publish else 'false'}", text))
     config_file.chmod(0o600)
     _systemctl("daemon-reload")
-    _systemctl("reset-failed", "x-project.service", "x-project.timer")
+    for name in ("x-project.service", "x-project.timer"):
+        if _systemctl("show", name, "--property=ActiveState", "--value") == "failed":
+            _systemctl("reset-failed", name)
     _systemctl("enable", "--now", "x-project.timer")
     _systemctl("is-active", "x-project.timer")
     return {"timer": "enabled", "publish_enabled": publish, "cadence": "每小时最多3条，小时内随机安排，最少间隔8分钟，不补发", "next": _systemctl("list-timers", "x-project.timer", "--no-pager")}

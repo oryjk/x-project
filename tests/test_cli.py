@@ -32,3 +32,13 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(main(["--root", str(root), "disable"]), 0)
             self.assertFalse(Config.load(root).publish_enabled)
             self.assertTrue((config.state/"cancel-version").read_text())
+
+    def test_reenable_does_not_reset_an_inactive_garbage_collected_unit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/"config.toml").write_text("publish_enabled = false\n")
+            config=Config(root,"tester","adb","serial",False,False,"中文","bound")
+            def systemctl(*args):
+                if args[0]=="reset-failed":raise RuntimeError("inactive unit not loaded")
+                return "inactive" if args[0]=="show" else "active"
+            with patch("x_project.cli.Path.home",return_value=root),patch("x_project.cli._systemctl",side_effect=systemctl):
+                self.assertEqual(install_timer(config,True)["timer"],"enabled")

@@ -105,3 +105,87 @@ class PipelineTest(unittest.TestCase):
         with self.assertRaises(DeviceError): p.publish(now=self.now)
         self.assertEqual(poster.calls, 0)
         self.assertEqual(p.store.get(1)["status"], "queued")
+
+    def live_pipeline(self, items=None):
+        from unittest.mock import Mock
+        research=Mock()
+        (self.config.root/"config.toml").write_text('account="tester"\nadb="adb"\nserial="serial"\nallow_unlock=false\npublish_enabled=true\npersona="中文"\ndevice_id="bound-test-device"\n')
+        fresh=draft("现场采集的独立新消息", "https://example.org/live");fresh.topic="live-topic";fresh.sources[0].published_at=self.now.isoformat()
+        research.generate.return_value=[fresh] if items is None else items
+        return Pipeline(self.config,researcher=research,verifier=Mock(),poster=Poster()),research
+
+    def test_no_research_before_a_send_slot(self):
+        p,research=self.live_pipeline()
+        result=p.tick(publish=True,now=self.now)
+        self.assertEqual(result["status"],"waiting")
+        research.generate.assert_not_called()
+        self.assertEqual(p.store.queued_count(),0)
+
+    def test_due_slot_only_sends_the_newly_collected_item_not_old_queue(self):
+        from unittest.mock import patch
+        p,research=self.live_pipeline();self.seed(p)
+        due=p.schedule.plan(self.now)[0]
+        now=datetime.fromtimestamp(due,timezone.utc);p.clock=lambda:now
+        with patch("x_project.pipeline.Config.load",return_value=self.config):result=p.tick(True,now)
+        self.assertEqual(result["status"],"sent")
+        self.assertEqual(result["id"],2)
+        self.assertEqual(p.store.get(1)["status"],"queued")
+        self.assertEqual(research.generate.call_count,1)
+
+    def test_empty_live_research_never_falls_back_to_precollected_queue(self):
+        p,research=self.live_pipeline([]);self.seed(p)
+        due=p.schedule.plan(self.now)[0];now=datetime.fromtimestamp(due,timezone.utc);p.clock=lambda:now
+        result=p.tick(True,now)
+        self.assertEqual(result["status"],"no-verified-news")
+        self.assertEqual(p.poster.calls,0)
+        self.assertEqual(p.store.get(1)["status"],"queued")
+
+    def test_three_minute_research_still_sends_within_its_window(self):
+        from datetime import timedelta
+        from unittest.mock import patch
+        p,_=self.live_pipeline();due=p.schedule.plan(self.now)[0]
+        now=datetime.fromtimestamp(due,timezone.utc);p.clock=lambda:now+timedelta(minutes=3)
+        with patch("x_project.pipeline.Config.load",return_value=self.config):result=p.tick(True,now)
+        self.assertEqual(result["status"],"sent")
+
+    def test_uncertain_previous_submit_blocks_new_research(self):
+        p,research=self.live_pipeline();self.seed(p)
+        row=p.store.claim(self.now);p.store.submitting(row["id"],self.now);p.store.finish(row["id"],"unknown")
+        due=p.schedule.plan(self.now)[0];now=datetime.fromtimestamp(due,timezone.utc);p.clock=lambda:now
+        self.assertEqual(p.tick(True,now)["status"],"blocked")
+        research.generate.assert_not_called()
+
+    def test_live_collection_saves_only_one_selected_candidate(self):
+        a=draft();a.sources[0].published_at=self.now.isoformat()
+        b=draft("第二条候选", "https://example.org/alternative");b.topic="alternative";b.sources[0].published_at=self.now.isoformat()
+        p,_=self.live_pipeline([a,b])
+        report=p.collect(3,enqueue_limit=1)
+        self.assertEqual(report["accepted_ids"],[1])
+        self.assertEqual(p.store.queued_count(),1)
+
+    def test_live_slot_waits_for_actual_eight_minute_gap_using_its_same_new_id(self):
+        from datetime import timedelta
+        p,_=self.live_pipeline();self.seed(p)
+        due=p.schedule.plan(self.now)[1]
+        ready=datetime.fromtimestamp(due+60,timezone.utc)
+        first=p.store.claim(ready-timedelta(minutes=9))
+        p.store.submitting(first["id"],ready-timedelta(minutes=3));p.store.finish(first["id"],"sent")
+        clock=[ready];waits=[]
+        p.clock=lambda:clock[0]
+        def sleep(seconds):waits.append(seconds);clock[0]+=timedelta(seconds=seconds)
+        p.sleep=sleep
+        result=p.tick(True,datetime.fromtimestamp(due,timezone.utc))
+        self.assertEqual(result["status"],"sent")
+        self.assertEqual(result["id"],2)
+        self.assertEqual(sum(waits),300)
+        self.assertLessEqual(max(waits),30)
+
+    def test_live_wait_stops_if_disable_arrives_before_submission_eligibility(self):
+        from datetime import timedelta
+        from x_project.pipeline import cancel_inflight
+        p,_=self.live_pipeline();self.seed(p);due=p.schedule.plan(self.now)[1]
+        ready=datetime.fromtimestamp(due+60,timezone.utc)
+        first=p.store.claim(ready-timedelta(minutes=9));p.store.submitting(first["id"],ready-timedelta(minutes=3));p.store.finish(first["id"],"sent")
+        p.clock=lambda:ready;p.sleep=lambda seconds:cancel_inflight(self.config)
+        self.assertEqual(p.tick(True,datetime.fromtimestamp(due,timezone.utc))["status"],"cancelled")
+        self.assertEqual(p.poster.calls,0)

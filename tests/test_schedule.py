@@ -29,3 +29,20 @@ class ScheduleTest(unittest.TestCase):
             last = datetime.fromtimestamp(times[2]+10, timezone.utc)
             self.assertEqual(s.take_due(last), times[2])
             self.assertIsNone(s.take_due(last))
+
+    def test_each_hour_leaves_ten_minutes_for_last_live_research(self):
+        with tempfile.TemporaryDirectory() as d:
+            scheduler=Schedule(Path(d)/"schedule.sqlite3",rng=random.Random(3))
+            now=datetime(2026,11,13,4,0,tzinfo=timezone.utc)
+            times=scheduler.plan(now)
+            self.assertLessEqual(times[-1]-int(now.timestamp()),50*60)
+
+    def test_pending_legacy_last_slot_is_moved_earlier_without_changing_claimed_slots(self):
+        with tempfile.TemporaryDirectory() as d:
+            scheduler=Schedule(Path(d)/"schedule.sqlite3")
+            now=datetime(2026,11,13,4,0,tzinfo=timezone.utc);hour=int(now.timestamp())
+            with scheduler.connection() as db:
+                db.executemany("insert into schedule(due,hour,status) values(?,?,?)",[(hour+18*60,hour,"claimed"),(hour+38*60,hour,"pending"),(hour+57*60,hour,"pending")])
+            self.assertEqual(scheduler.plan(now),[hour+18*60,hour+38*60,hour+50*60])
+            with scheduler.connection() as db:
+                self.assertEqual(db.execute("select status from schedule where due=?",(hour+18*60,)).fetchone()[0],"claimed")

@@ -1,6 +1,6 @@
 """Durable queue: once submission may have happened, never retry automatically."""
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -55,7 +55,22 @@ class Store:
                 db.executemany("INSERT INTO sources(url,post_id) VALUES(?,?)", [(url, row.lastrowid) for url in urls])
             except sqlite3.IntegrityError:
                 return False
-            return True
+            return row.lastrowid
+
+    def has_unresolved(self):
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM posts WHERE status IN ('unknown','submitting') LIMIT 1").fetchone() is not None
+
+    def next_eligible_at(self, now):
+        with self.connection() as db:
+            last_claim = db.execute("SELECT max(slot) FROM slots").fetchone()[0]
+            last_submit = db.execute("SELECT max(submitted_at) FROM posts").fetchone()[0]
+        times = [now.timestamp()]
+        if last_claim is not None:
+            times.append(last_claim+480)
+        if last_submit:
+            times.append(datetime.fromisoformat(last_submit).timestamp()+480)
+        return datetime.fromtimestamp(max(times), timezone.utc)
 
     def recover(self):
         with self.connection() as db:
@@ -105,7 +120,8 @@ class Store:
         now = now or utcnow()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if due_at is not None and not 0 <= now.timestamp()-due_at <= 120:
+            if due_at is not None and (not 0 <= now.timestamp()-due_at <= 600
+                                       or int(now.timestamp())//3600 != int(due_at)//3600):
                 raise SubmissionBlocked("发布时间已过期或尚未到，不补发")
             last = db.execute("SELECT max(submitted_at) FROM posts WHERE submitted_at IS NOT NULL").fetchone()[0]
             if last and (now - datetime.fromisoformat(last)).total_seconds() < 480:

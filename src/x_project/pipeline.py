@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import tomllib
+import time
 import uuid
 
 from .android import Adb, DeviceError, PhonePoster
@@ -69,6 +70,7 @@ class Pipeline:
     def __init__(self, config, researcher=None, verifier=None, poster=None, clock=None):
         self.config = config
         self.clock = clock or utcnow
+        self.sleep = time.sleep
         self.cancel_version = cancellation_version(config)
         self.store = Store(config.state/"queue.sqlite3")
         self.schedule = Schedule(config.state/"schedule.sqlite3")
@@ -77,21 +79,26 @@ class Pipeline:
         self.poster = poster or PhonePoster(Adb(config.adb, config.serial, config.device_id), config.account,
                                           config.root/".env", config.state, config.allow_unlock, config.unlock_method)
 
-    def collect(self, count=3):
+    def collect(self, count=3, enqueue_limit=None):
         history = [{"topic": row["topic"], "sources": json.loads(row["draft"])["sources"]} for row in self.store.rows(90)]
         generated = self.researcher.generate(count, history, self.config.persona)
-        accepted = 0; rejected = []
+        accepted_ids = []; rejected = []
         for draft in generated:
             try:
                 validate_draft(draft)
                 self.verifier.verify(draft)
-                if self.store.enqueue(draft): accepted += 1
-                else: rejected.append({"topic": draft.topic, "reason": "重复事件、正文或来源"})
+                post_id = self.store.enqueue(draft)
+                if post_id:
+                    accepted_ids.append(post_id)
+                    if enqueue_limit is not None and len(accepted_ids) >= enqueue_limit:
+                        break
+                else:
+                    rejected.append({"topic": draft.topic, "reason": "重复事件、正文或来源"})
             except (ContentError, ValueError, KeyError):
                 # Reasons are content-only; never include subprocess environments or credentials.
                 import sys
                 rejected.append({"topic": draft.topic, "reason": str(sys.exception())})
-        report = {"generated": len(generated), "accepted": accepted, "rejected": rejected}
+        report = {"generated": len(generated), "accepted": len(accepted_ids), "accepted_ids": accepted_ids, "rejected": rejected}
         (self.config.state/"last-collect.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         return report
 
@@ -171,23 +178,42 @@ class Pipeline:
             raise
 
     def tick(self, publish=False, now=None):
-        now = now or utcnow()
+        now = now or self.clock()
         self.store.recover()
         self.retire_invalid(now)
         self.schedule.plan(now)
+        if self.store.has_unresolved():
+            return {"status": "blocked", "note": "有尚未核对的提交，不继续采集或发布"}
         due = self.schedule.take_due(now) if publish and self.config.publish_enabled else None
-        generation_marker = self.config.state/"last-generation-hour"
-        hour = str(int(now.timestamp())//3600)
-        if self.store.queued_count() < 3 and (not generation_marker.exists() or generation_marker.read_text() != hour):
-            generation_marker.write_text(hour)  # One model batch/hour; failed sources must not cause minute-by-minute generation.
-            try:
-                self.collect(3)
-            except ContentError as error:
-                return {"status": "research-unavailable", "note": str(error)}
         if due is None:
             return {"status": "waiting", "publish_enabled": self.config.publish_enabled, "planned": self.schedule.upcoming(now)}
-        # Slow generation must not turn an old due time into catch-up posting.
+        # Research belongs to this send slot. Never take a pre-collected queue head.
+        try:
+            report = self.collect(3, enqueue_limit=1)
+        except ContentError as error:
+            return {"status": "research-unavailable", "note": str(error), "due_at": due}
+        if not report["accepted_ids"]:
+            return {"status": "no-verified-news", "research": report, "due_at": due}
+        # Research duration varies. Keep this slot/id while its lawful submit
+        # time is still inside the same window instead of dropping the slot.
+        deadline = min(due+600, (int(due)//3600+1)*3600-.001)
+        while True:
+            if cancellation_version(self.config) != self.cancel_version or not Config.load(self.config.root).publish_enabled:
+                self.store.reject(report["accepted_ids"][0], "本次发送已取消")
+                return {"status": "cancelled", "note": "任务已停止，未提交帖子"}
+            current = self.clock()
+            eligible = self.store.next_eligible_at(current)
+            if eligible.timestamp() > deadline:
+                self.store.reject(report["accepted_ids"][0], "发送窗口内无法满足实际8分钟间隔")
+                return {"status": "skipped", "note": "本时段剩余时间不足，不补发"}
+            delay = (eligible-current).total_seconds()
+            if delay <= 0:
+                break
+            self.sleep(min(delay, 30))
         actual = self.clock()
-        if actual.timestamp()-due > 120:
+        if actual.timestamp()-due > 600 or int(actual.timestamp())//3600 != int(due)//3600:
+            self.store.reject(report["accepted_ids"][0], "本次现场采集超过发送窗口，不留给后续时段发送")
             return {"status": "skipped", "note": "当前计划已过期，不补发"}
-        return self.publish(now=actual, due_at=due, automatic=True)
+        result = self.publish(post_id=report["accepted_ids"][0], now=actual, due_at=due, automatic=True)
+        result["research"] = report
+        return result

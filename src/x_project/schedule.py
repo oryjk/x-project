@@ -27,6 +27,9 @@ class Schedule:
         hour = int(now.timestamp()) // 3600 * 3600
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Migrate only an unclaimed legacy final slot; leave ten minutes for live work.
+            db.execute("UPDATE OR IGNORE schedule SET due=? WHERE hour=? AND status='pending' AND due>? "
+                       "AND due=(SELECT max(due) FROM schedule WHERE hour=?)", (hour+3000, hour, hour+3000, hour))
             rows = [r[0] for r in db.execute("SELECT due FROM schedule WHERE hour=? ORDER BY due", (hour,))]
             if rows:
                 return rows
@@ -34,7 +37,7 @@ class Schedule:
             first_min = max(4, (previous + 480-hour+59)//60 if previous else 4)
             first = self.rng.randrange(first_min, 19)
             second = self.rng.randrange(max(26, first+8), 40)
-            candidates = [m for m in range(max(47, second+8), 59) if m-second != second-first]
+            candidates = [m for m in range(max(47, second+8), 51) if m-second != second-first]
             third = self.rng.choice(candidates)
             due_times = [hour + minute*60 for minute in (first, second, third)]
             db.executemany("INSERT INTO schedule(due,hour) VALUES(?,?)", [(t, hour) for t in due_times])

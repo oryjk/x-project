@@ -122,7 +122,13 @@ def validate_draft(draft, now=None):
         raise ContentError("每条需要 1–2 个真实来源")
     valid_kinds = {"article", "post", "video_transcript", "video_description", "video_title"}
     for s in draft.sources:
-        s.url = canonical_url(s.url)
+        canonical = canonical_url(s.url)
+        # Canonical identity is for dedupe. Some article servers treat /path
+        # and /path/ differently; fetch exactly the URL the researcher opened.
+        if urlsplit(canonical).hostname in ("x.com", "www.youtube.com"):
+            s.url = canonical
+        else:
+            s.url = s.url.strip()
         if s.kind not in valid_kinds or not s.title.strip() or not 15 <= len(s.excerpt.strip()) <= 350:
             raise ContentError("来源需要类型、标题及可核对的短证据")
         age = now - timestamp(s.published_at)
@@ -130,7 +136,7 @@ def validate_draft(draft, now=None):
             raise ContentError("来源过旧或发布时间在未来")
     if all(s.kind == "video_title" for s in draft.sources):
         raise ContentError("只有视频标题不能支持内容分析，需要正文/字幕/原帖证据")
-    if len({s.url for s in draft.sources}) != len(draft.sources):
+    if len({canonical_url(s.url) for s in draft.sources}) != len(draft.sources):
         raise ContentError("引用来源重复")
     if weighted_length(draft.text) > 280:
         raise ContentError("超出普通 X 帖子的保守长度预算")

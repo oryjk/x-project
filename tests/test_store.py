@@ -58,7 +58,7 @@ class StoreTest(unittest.TestCase):
         from x_project.content import ContentError
         self.store.enqueue(draft(), self.now); row = self.store.claim(self.now)
         with self.assertRaises(ContentError):
-            self.store.submitting(row["id"], self.now.replace(minute=3), due_at=self.now.timestamp())
+            self.store.submitting(row["id"], self.now.replace(minute=11), due_at=self.now.timestamp())
 
     def test_cross_hour_delayed_submission_counts_in_the_hour_it_is_actually_clicked(self):
         from x_project.content import ContentError
@@ -74,3 +74,9 @@ class StoreTest(unittest.TestCase):
         last = self.store.claim(next_hour.replace(minute=30))
         self.assertIsNotNone(last)
         with self.assertRaises(ContentError): self.store.submitting(last["id"], next_hour.replace(minute=30))
+
+    def test_send_window_does_not_roll_into_next_hour(self):
+        from x_project.content import ContentError
+        self.store.enqueue(draft(),self.now);row=self.store.claim(self.now.replace(minute=57))
+        with self.assertRaises(ContentError):
+            self.store.submitting(row["id"],self.now.replace(hour=self.now.hour+1),due_at=self.now.replace(minute=57).timestamp())
