@@ -18,7 +18,7 @@ def _run(config, args, *, stdin=None):
 
 
 def pair_device(config):
-    values = environment(config.root)
+    values = config.device_values()
     host = values.get('X_ADB_PAIR_HOST') or values.get('X_ADB_HOST') or config.serial.rpartition(':')[0]
     address = endpoint(host, values.get('X_ADB_PAIR_PORT', ''), 'X_ADB_PAIR_HOST/X_ADB_PAIR_PORT')
     code = values.get('X_ADB_PAIR_CODE', '')

@@ -13,7 +13,9 @@ class SubmissionBlocked(ContentError):
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, *, hourly_limit=3, min_interval_minutes=8):
+        self.hourly_limit = hourly_limit
+        self.gap_seconds = min_interval_minutes * 60
         self.path = Path(path)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self.connection() as db:
@@ -67,9 +69,9 @@ class Store:
             last_submit = db.execute("SELECT max(submitted_at) FROM posts").fetchone()[0]
         times = [now.timestamp()]
         if last_claim is not None:
-            times.append(last_claim+480)
+            times.append(last_claim+self.gap_seconds)
         if last_submit:
-            times.append(datetime.fromisoformat(last_submit).timestamp()+480)
+            times.append(datetime.fromisoformat(last_submit).timestamp()+self.gap_seconds)
         return datetime.fromtimestamp(max(times), timezone.utc)
 
     def recover(self):
@@ -98,10 +100,10 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM slots WHERE slot=?", (slot,)).fetchone():
                 return None
-            if db.execute("SELECT count(*) FROM slots WHERE slot>=? AND slot<?", (hour, hour+3600)).fetchone()[0] >= 3:
+            if db.execute("SELECT count(*) FROM slots WHERE slot>=? AND slot<?", (hour, hour+3600)).fetchone()[0] >= self.hourly_limit:
                 return None
             last = db.execute("SELECT max(slot) FROM slots").fetchone()[0]
-            if last is not None and slot-last < 480:
+            if last is not None and slot-last < self.gap_seconds:
                 return None
             # An unresolved send blocks further automation until explicitly resolved.
             if db.execute("SELECT 1 FROM posts WHERE status IN ('unknown','submitting')").fetchone():
@@ -124,12 +126,12 @@ class Store:
                                        or int(now.timestamp())//3600 != int(due_at)//3600):
                 raise SubmissionBlocked("发布时间已过期或尚未到，不补发")
             last = db.execute("SELECT max(submitted_at) FROM posts WHERE submitted_at IS NOT NULL").fetchone()[0]
-            if last and (now - datetime.fromisoformat(last)).total_seconds() < 480:
-                raise SubmissionBlocked("距离上次实际提交不足8分钟")
+            if last and (now - datetime.fromisoformat(last)).total_seconds() < self.gap_seconds:
+                raise SubmissionBlocked(f"距离上次实际提交不足{self.gap_seconds//60}分钟")
             start = now.replace(minute=0, second=0, microsecond=0)
             count = db.execute("SELECT count(*) FROM posts WHERE submitted_at>=? AND submitted_at<?", (start.isoformat(), (start+timedelta(hours=1)).isoformat())).fetchone()[0]
-            if count >= 3:
-                raise SubmissionBlocked("当前小时实际提交已达到3条")
+            if count >= self.hourly_limit:
+                raise SubmissionBlocked(f"当前小时实际提交已达到{self.hourly_limit}条")
             result = db.execute("UPDATE posts SET status='submitting', submitted_at=? WHERE id=? AND status='prepared'", (now.isoformat(), post_id))
             if result.rowcount != 1:
                 raise RuntimeError("草稿状态不允许提交")

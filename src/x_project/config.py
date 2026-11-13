@@ -1,5 +1,6 @@
 """Portable configuration; phone secrets are never exported by the loader."""
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -102,10 +103,31 @@ class Config:
     device_id: str = ''
     unlock_method: str = 'pin'
     codex: str = 'codex'
+    profile: str = ''
+    platform: str = 'x'
+    device_name: str = ''
+    hourly_limit: int = 3
+    min_interval_minutes: int = 8
+    images: tuple[str, ...] = ()
+    font_path: str = ''
+    legacy_state: bool = False
+    legacy_device_state: bool = False
+    namespace: str = ''
+    device_namespace: str = ''
 
     @classmethod
-    def load(cls, root):
+    def load(cls, root, profile=None):
         root = Path(root).resolve()
+        if environment(root).get('X_PROFILES'):
+            configs = cls.load_all(root)
+            if profile is None and len(configs) == 1:
+                return configs[0]
+            for config in configs:
+                if config.profile == profile:
+                    return config
+            raise ValueError('请使用 --profile 选择有效账号，或使用 --all')
+        if profile:
+            raise ValueError('没有配置 X_PROFILES，无法选择 --profile')
         legacy = root / 'config.toml'
         values = dict(account='', adb='adb', serial='', allow_unlock=False,
                       publish_enabled=False, persona='AI/科技专家视角，中文简洁直说，事实与个人判断分开。',
@@ -149,8 +171,42 @@ class Config:
     @property
     def state(self):
         path = self.root / '.state'
+        if self.namespace:
+            path = path / self.namespace
+        elif self.profile and not self.legacy_state:
+            identity = hashlib.sha256(self.account.lstrip('@').casefold().encode()).hexdigest()[:24]
+            path = path / 'accounts' / self.platform / identity
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         return path
+
+    @classmethod
+    def load_all(cls, root):
+        from .profiles import load_profiles
+        root = Path(root).resolve()
+        if not environment(root).get('X_PROFILES'):
+            return [cls.load(root)]
+        return load_profiles(root)
+
+    @property
+    def credential_prefix(self):
+        return f'X_DEVICE_{self.device_name.upper()}_' if self.device_name else ''
+
+    @property
+    def device_state(self):
+        if self.device_namespace:
+            return self.root / '.state' / self.device_namespace
+        if not self.profile or self.legacy_device_state:
+            return self.root / '.state'
+        identity = hashlib.sha256((self.device_id or self.serial).encode()).hexdigest()[:24]
+        return self.root / '.state' / 'devices' / identity
+
+    def device_values(self):
+        values = environment(self.root)
+        if not self.credential_prefix:
+            return values
+        suffixes = ('ADB_HOST', 'ADB_PORT', 'ADB_SERIAL', 'ADB_PAIR_HOST', 'ADB_PAIR_PORT',
+                    'ADB_PAIR_CODE', 'PHONE_PIN', 'PHONE_PATTERN')
+        return {'X_' + key: values.get(self.credential_prefix + key, '') for key in suffixes}
 
     def set_publish_enabled(self, enabled):
         write_private(self.state / 'publish-enabled', 'true\n' if enabled else 'false\n')

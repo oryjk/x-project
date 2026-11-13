@@ -10,7 +10,7 @@ import uuid
 
 from .android import Adb, DeviceError, PhonePoster
 from .config import Config
-from .content import ContentError, Draft, timestamp, utcnow, validate_draft, weighted_length
+from .content import ContentError, Draft, timestamp, utcnow, validate_draft, validate_note_media, weighted_length
 from .research import CodexResearcher, SourceVerifier
 from .schedule import Schedule
 from .store import Store, SubmissionBlocked
@@ -45,12 +45,20 @@ class Pipeline:
         self.clock = clock or utcnow
         self.sleep = time.sleep
         self.cancel_version = cancellation_version(config)
-        self.store = Store(config.state/"queue.sqlite3")
-        self.schedule = Schedule(config.state/"schedule.sqlite3")
-        self.researcher = researcher or CodexResearcher(executable=config.codex, audit_dir=config.state, project_root=config.root)
+        self.store = Store(config.state/"queue.sqlite3", hourly_limit=config.hourly_limit, min_interval_minutes=config.min_interval_minutes)
+        self.schedule = Schedule(config.state/"schedule.sqlite3", hourly_limit=config.hourly_limit, min_interval_minutes=config.min_interval_minutes)
+        self.researcher = researcher or CodexResearcher(executable=config.codex, audit_dir=config.state, project_root=config.root, platform=config.platform)
         self.verifier = verifier or SourceVerifier()
-        self.poster = poster or PhonePoster(Adb(config.adb, config.serial, config.device_id), config.account,
-                                          config.root/".env", config.state, config.allow_unlock, config.unlock_method)
+        poster_class = PhonePoster
+        if config.platform == 'xiaohongshu':
+            from .xiaohongshu import XiaohongshuPoster
+            poster_class = XiaohongshuPoster
+        self.poster = poster or poster_class(Adb(config.adb, config.serial, config.device_id), config.account,
+                                          config.root/".env", config.device_state, config.allow_unlock, config.unlock_method,
+                                          credential_prefix=config.credential_prefix)
+
+    def current_config(self):
+        return Config.load(self.config.root, self.config.profile) if self.config.profile else Config.load(self.config.root)
 
     def collect(self, count=3, enqueue_limit=None):
         history = [{"topic": row["topic"], "sources": json.loads(row["draft"])["sources"]} for row in self.store.rows(90)]
@@ -58,8 +66,17 @@ class Pipeline:
         accepted_ids = []; rejected = []; verified_sources = 0
         for draft in generated:
             try:
+                if draft.platform != self.config.platform:
+                    raise ContentError('候选平台与当前账号不匹配')
                 validate_draft(draft)
                 self.verifier.verify(draft)
+                if self.config.platform == 'xiaohongshu':
+                    from .cards import ensure_note_images
+                    if self.config.images:
+                        draft.images = list(self.config.images)
+                    draft = ensure_note_images(draft, self.config.state, self.config.font_path)
+                    if len(draft.images) != 1:
+                        raise ContentError('当前小红书发布端只支持一张封面')
                 verified_sources += len(draft.sources)
                 post_id = self.store.enqueue(draft)
                 if post_id:
@@ -77,27 +94,49 @@ class Pipeline:
         (self.config.state/"last-collect.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         return report
 
-    def add(self, text):
+    def manual_draft(self, text, title='', images=None):
         text = text.strip()
-        if not text or "\x00" in text or weighted_length(text) > 280:
+        if not text or "\x00" in text:
+            raise ContentError('手动文案为空或格式无效')
+        if self.config.platform == 'xiaohongshu':
+            if not title or not title.strip() or len(title) > 20 or any(c in title for c in '\x00\r\n') or len(text) > 1000:
+                raise ContentError('小红书需要单行1–20字标题及不超过1000字正文')
+            draft = Draft(text, 'manual-' + hashlib.sha256(text.encode()).hexdigest()[:16], [], title=title,
+                          images=list(images or self.config.images), platform='xiaohongshu')
+            validate_note_media(draft)
+            if len(draft.images) != 1:
+                raise ContentError('当前小红书发布端只支持一张封面')
+            return draft
+        if title or images:
+            raise ContentError('X文字发布不使用 --title / --image')
+        if weighted_length(text) > 280:
             raise ContentError("手动文案为空或超出长度预算；网址请单独占一行")
-        draft = Draft(text, "manual-"+hashlib.sha256(text.encode()).hexdigest()[:16], [])
+        return Draft(text, "manual-"+hashlib.sha256(text.encode()).hexdigest()[:16], [])
+
+    def add(self, text, title='', images=None):
+        draft = self.manual_draft(text, title, images)
         self.store.enqueue(draft)
         return next(row["id"] for row in self.store.rows(10000) if row["fingerprint"] == draft.fingerprint)
 
     def preview(self, post_id):
         draft = self.store.draft(post_id)
+        if draft.platform != self.config.platform:
+            raise ContentError('草稿平台与当前账号不匹配')
         with self.poster.session():
-            self.poster.prepare(draft.text)
+            if self.config.platform == 'xiaohongshu':
+                validate_note_media(draft); self.poster.prepare_note(draft)
+            else:
+                self.poster.prepare(draft.text)
         return {"status": "preview", "id": post_id, "account": self.config.account,
                 "text": draft.text, "note": "仅填写并核对，未点击发布"}
 
-    def preview_text(self, text):
-        text = text.strip()
-        if not text or "\x00" in text or weighted_length(text) > 280:
-            raise ContentError("预览文案为空或超出长度预算")
+    def preview_text(self, text, title='', images=None):
+        draft = self.manual_draft(text, title, images)
         with self.poster.session():
-            self.poster.prepare(text)
+            if self.config.platform == 'xiaohongshu':
+                self.poster.prepare_note(draft)
+            else:
+                self.poster.prepare(draft.text)
         return {"status": "preview", "account": self.config.account, "text": text,
                 "note": "只预览，不进入自动发布队列"}
 
@@ -124,19 +163,32 @@ class Pipeline:
         draft = Draft.from_dict(json.loads(row["draft"]))
         # Revalidate automated sources at send time. A queued item can become stale while offline.
         try:
+            if draft.platform != self.config.platform:
+                raise ContentError('草稿平台与当前账号不匹配')
+            if self.config.platform == 'xiaohongshu':
+                validate_note_media(draft)
             if draft.sources:
                 validate_draft(draft, now)
             def before_submit():
                 if cancellation_version(self.config) != self.cancel_version:
                     raise DeviceError("任务已被停止，未提交帖子")
-                if automatic and not Config.load(self.config.root).publish_enabled:
-                    raise DeviceError("自动发布已关闭")
+                if automatic:
+                    current = self.current_config()
+                    if not current.publish_enabled:
+                        raise DeviceError("自动发布已关闭")
+                    if (current.account, current.platform, current.device_id) != (self.config.account, self.config.platform, self.config.device_id):
+                        raise DeviceError('账号或设备配置已变化，本次停止提交')
+                    self.store.hourly_limit = current.hourly_limit
+                    self.store.gap_seconds = current.min_interval_minutes * 60
                 actual = self.clock()
                 if draft.sources:
                     validate_draft(draft, actual)
                 self.store.submitting(row["id"], actual, due_at)
             with self.poster.session():
-                status, note = self.poster.send(draft.text, draft.body, before_submit)
+                if self.config.platform == 'xiaohongshu':
+                    status, note = self.poster.send_note(draft, before_submit)
+                else:
+                    status, note = self.poster.send(draft.text, draft.body, before_submit)
             self.store.finish(row["id"], status, note)
             return {"status": status, "id": row["id"], "note": note}
         except Exception as error:
@@ -173,13 +225,13 @@ class Pipeline:
         # time is still inside the same window instead of dropping the slot.
         deadline = min(due+600, (int(due)//3600+1)*3600-.001)
         while True:
-            if cancellation_version(self.config) != self.cancel_version or not Config.load(self.config.root).publish_enabled:
+            if cancellation_version(self.config) != self.cancel_version or not self.current_config().publish_enabled:
                 self.store.reject(report["accepted_ids"][0], "本次发送已取消")
                 return {"status": "cancelled", "note": "任务已停止，未提交帖子"}
             current = self.clock()
             eligible = self.store.next_eligible_at(current)
             if eligible.timestamp() > deadline:
-                self.store.reject(report["accepted_ids"][0], "发送窗口内无法满足实际8分钟间隔")
+                self.store.reject(report["accepted_ids"][0], "发送窗口内无法满足账号的实际最小间隔")
                 return {"status": "skipped", "note": "本时段剩余时间不足，不补发"}
             delay = (eligible-current).total_seconds()
             if delay <= 0:

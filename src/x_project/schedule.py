@@ -6,12 +6,15 @@ import sqlite3
 
 
 class Schedule:
-    def __init__(self, path, rng=None):
+    def __init__(self, path, rng=None, *, hourly_limit=3, min_interval_minutes=8):
         self.path = Path(path)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.rng = rng or random.SystemRandom()
+        self.hourly_limit = hourly_limit
+        self.gap_minutes = min_interval_minutes
         with self.connection() as db:
             db.execute("CREATE TABLE IF NOT EXISTS schedule(due INTEGER PRIMARY KEY,hour INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending')")
+            db.execute('CREATE TABLE IF NOT EXISTS planned_hours(hour INTEGER PRIMARY KEY)')
         self.path.chmod(0o600)
 
     @contextmanager
@@ -30,16 +33,26 @@ class Schedule:
             # Migrate only an unclaimed legacy final slot; leave ten minutes for live work.
             db.execute("UPDATE OR IGNORE schedule SET due=? WHERE hour=? AND status='pending' AND due>? "
                        "AND due=(SELECT max(due) FROM schedule WHERE hour=?)", (hour+3000, hour, hour+3000, hour))
-            rows = [r[0] for r in db.execute("SELECT due FROM schedule WHERE hour=? ORDER BY due", (hour,))]
+            rows = [r[0] for r in db.execute("SELECT due FROM schedule WHERE hour=? AND status!='cancelled' ORDER BY due", (hour,))]
             if rows:
-                return rows
-            previous = db.execute("SELECT max(due) FROM schedule WHERE due<?", (hour,)).fetchone()[0]
-            first_min = max(4, (previous + 480-hour+59)//60 if previous else 4)
-            first = self.rng.randrange(first_min, 19)
-            second = self.rng.randrange(max(26, first+8), 40)
-            candidates = [m for m in range(max(47, second+8), 51) if m-second != second-first]
-            third = self.rng.choice(candidates)
-            due_times = [hour + minute*60 for minute in (first, second, third)]
+                excess = len(rows) - self.hourly_limit
+                for row in db.execute("SELECT due FROM schedule WHERE hour=? AND status='pending' ORDER BY due DESC", (hour,)).fetchall():
+                    if excess <= 0: break
+                    db.execute("UPDATE schedule SET status='cancelled' WHERE due=?", (row[0],)); excess -= 1
+                return [r[0] for r in db.execute("SELECT due FROM schedule WHERE hour=? AND status!='cancelled' ORDER BY due", (hour,))]
+            if db.execute('SELECT 1 FROM planned_hours WHERE hour=?', (hour,)).fetchone():
+                return []
+            db.execute('INSERT INTO planned_hours(hour) VALUES(?)', (hour,))
+            if not self.hourly_limit:
+                return []
+            previous = db.execute("SELECT max(due) FROM schedule WHERE due<? AND status!='cancelled'", (hour,)).fetchone()[0]
+            gap = self.gap_minutes
+            first_min = max(4, (previous + gap*60-hour+59)//60 if previous else 4)
+            upper = 50 - (self.hourly_limit-1)*(gap-1)
+            if upper-first_min+1 < self.hourly_limit:
+                return []
+            base = sorted(self.rng.sample(range(first_min, upper+1), self.hourly_limit))
+            due_times = [hour + (minute+i*(gap-1))*60 for i, minute in enumerate(base)]
             db.executemany("INSERT INTO schedule(due,hour) VALUES(?,?)", [(t, hour) for t in due_times])
             return due_times
 
@@ -58,4 +71,4 @@ class Schedule:
     def upcoming(self, now):
         self.plan(now)
         with self.connection() as db:
-            return [{"due": r[0], "status": r[1]} for r in db.execute("SELECT due,status FROM schedule WHERE hour>=? ORDER BY due LIMIT 9", (int(now.timestamp())//3600*3600,))]
+            return [{"due": r[0], "status": r[1]} for r in db.execute("SELECT due,status FROM schedule WHERE hour>=? AND status!='cancelled' ORDER BY due LIMIT 9", (int(now.timestamp())//3600*3600,))]

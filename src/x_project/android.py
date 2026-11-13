@@ -223,7 +223,7 @@ class Adb:
 
 
 class PhonePoster:
-    def __init__(self, adb, account, env_file, state_dir, allow_unlock=False, unlock_method="pin"):
+    def __init__(self, adb, account, env_file, state_dir, allow_unlock=False, unlock_method="pin", *, credential_prefix=''):
         if unlock_method not in ("pin", "pattern"):
             raise DeviceError("unlock_method 必须是 pin 或 pattern")
         self.unlock_method = unlock_method
@@ -233,6 +233,7 @@ class PhonePoster:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.allow_unlock = allow_unlock
+        self.credential_prefix = credential_prefix
 
     def _credential(self):
         if not self.allow_unlock:
@@ -242,6 +243,8 @@ class PhonePoster:
         except ValueError:
             raise DeviceError('.env 权限过宽，请先 chmod 600 .env') from None
         keys = PATTERN_KEYS if self.unlock_method == 'pattern' else PIN_KEYS
+        if self.credential_prefix:
+            keys = (self.credential_prefix + ('PHONE_PATTERN' if self.unlock_method == 'pattern' else 'PHONE_PIN'),)
         exported = {key: os.environ[key] for key in keys if key in os.environ}
         if exported:
             values = exported
@@ -384,6 +387,13 @@ class PhonePoster:
 
     @contextmanager
     def session(self):
+        from .locks import device_lock
+        with device_lock(self.state_dir):
+            with self._session():
+                yield self
+
+    @contextmanager
+    def _session(self):
         self.adb.check()
         was_on = self.adb.screen_on()
         timeout = self.adb.shell(["settings", "get", "system", "screen_off_timeout"]).strip()

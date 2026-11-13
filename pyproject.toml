@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "x-project"
-version = "0.1.3"
-description = "Source-grounded AI news drafting and Android X posting"
+version = "0.2.0"
+description = "Source-grounded AI news and multi-account Android publishing for X and Xiaohongshu"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+cards = ["Pillow>=10"]
 
 [project.scripts]
 x-project = "x_project.cli:main"
