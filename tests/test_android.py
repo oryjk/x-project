@@ -217,3 +217,35 @@ class AndroidTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             poster=PhonePoster(Phone(),"tester",Path(d)/".env",d)
             with self.assertRaises(DeviceError):poster.send("正式正文","正式正文",lambda:None)
+
+    def test_prepare_waits_for_account_identity_without_changing_or_posting(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            calls=0
+            def dump(self):
+                self.calls+=1
+                return xml().replace("@tester，切换账号","切换账号") if self.calls==1 else xml()
+            def shell(self,args):raise AssertionError("must not change draft or tap")
+        with tempfile.TemporaryDirectory() as d:
+            phone=Phone();poster=PhonePoster(phone,"tester",Path(d)/".env",d)
+            with patch("x_project.android.time.sleep"):
+                self.assertEqual(poster.prepare("你好，AI。\n第二行"),(1001,211))
+            self.assertEqual(phone.calls,2)
+
+    def test_wrong_account_is_rejected_without_waiting_or_switching(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            calls=0
+            def dump(self):self.calls+=1;return xml(handle="other")
+            def shell(self,args):raise AssertionError("must not switch or tap")
+        with tempfile.TemporaryDirectory() as d:
+            phone=Phone();poster=PhonePoster(phone,"tester",Path(d)/".env",d)
+            with patch("x_project.android.time.sleep") as sleep:
+                with self.assertRaises(DeviceError):poster.prepare("你好，AI。\n第二行")
+            self.assertEqual(phone.calls,1);sleep.assert_not_called()

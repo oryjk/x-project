@@ -19,6 +19,10 @@ class DeviceError(RuntimeError):
     pass
 
 
+class ComposerNotReady(DeviceError):
+    pass
+
+
 def shell_command(args):
     return shlex.join([str(arg) for arg in args])
 
@@ -103,6 +107,8 @@ def inspect_composer(xml, expected_text, expected_account):
     root = _root(xml)
     nodes = _nodes(root)
     editors = [n for n in nodes if n.get("class") == "android.widget.EditText"]
+    if not editors:
+        raise ComposerNotReady("X 编辑器还在加载")
     if len(editors) != 1 or not _same_text(editors[0].get("text", ""), expected_text):
         raise DeviceError("编辑框全文与待发文案不一致，停止提交")
     accounts = set()
@@ -112,9 +118,13 @@ def inspect_composer(xml, expected_text, expected_account):
             match = re.search(r"@([A-Za-z0-9_]+)", desc)
             if match:
                 accounts.add(match.group(1).casefold())
+    if not accounts:
+        raise ComposerNotReady("X 发帖账号身份还未加载")
     if accounts != {expected_account.lstrip("@").casefold()}:
         raise DeviceError("当前发帖账号与配置不一致或无法识别")
     targets = [n for n in nodes if n.get("content-desc", "") in ("发帖", "发布", "Post", "Tweet")]
+    if not targets:
+        raise ComposerNotReady("X 发布按钮还未加载")
     if len(targets) != 1:
         raise DeviceError("无法唯一识别发布按钮")
     target = targets[0]
@@ -356,25 +366,35 @@ class PhonePoster:
         editors = [n for n in _nodes(_root(existing)) if n.get("class") == "android.widget.EditText"]
         if editors:
             # Only an exact preview of THIS post can be resumed. Never overwrite a user's draft.
-            return inspect_composer(existing, text, self.account)
+            return self._wait_composer(text, existing)
         result = self.adb.shell(["am", "start", "-W", "-a", "android.intent.action.SEND", "-t", "text/plain",
                                  "-n", "com.twitter.android/com.twitter.composer.ComposerActivity", "--es", "android.intent.extra.TEXT", text])
         if "Error:" in result or "Exception" in result:
             raise DeviceError("X 编辑器无法打开")
         time.sleep(0.5)
-        return inspect_composer(self.adb.dump(), text, self.account)
+        return self._wait_composer(text)
+
+    def _wait_composer(self, text, initial=None):
+        for attempt in range(4):
+            xml = initial if attempt == 0 and initial is not None else self.adb.dump()
+            try:
+                return inspect_composer(xml, text, self.account)
+            except ComposerNotReady:
+                if attempt == 3:
+                    raise DeviceError("X 编辑器或账号身份持续未加载，请检查手机网络后重试") from None
+                time.sleep(.5)
 
     def send(self, text, body, before_submit):
         # Preserve unrelated drafts before navigating to the account profile.
         existing = self.adb.dump()
         if any(n.get("class") == "android.widget.EditText" for n in _nodes(_root(existing))):
-            inspect_composer(existing, text, self.account)
+            self._wait_composer(text, existing)
         self._open_profile()
         if profile_post(self.adb.dump(), body, self.account):
             raise DeviceError("账号主页已有相同正文，停止提交以避免重复")
         self.prepare(text)
         # Refresh semantics immediately before the only irreversible tap.
-        x, y = inspect_composer(self.adb.dump(), text, self.account)
+        x, y = self._wait_composer(text)
         before_submit()
         started = time.monotonic()
         self.adb.shell(["input", "tap", str(x), str(y)])
