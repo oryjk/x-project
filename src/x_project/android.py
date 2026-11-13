@@ -10,27 +10,13 @@ import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 
+from .config import parse_dotenv, read_dotenv, PIN_KEYS, PATTERN_KEYS
+
 PACKAGE = "com.twitter.android"
 
 
 class DeviceError(RuntimeError):
     pass
-
-
-def parse_dotenv(text):
-    values = {}
-    for line in text.splitlines():
-        match = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
-        if not match:
-            continue
-        key, value = match.groups()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        else:
-            value = re.sub(r"\s+#.*$", "", value)
-        values[key] = value
-    return values
 
 
 def shell_command(args):
@@ -233,14 +219,16 @@ class PhonePoster:
         self.allow_unlock = allow_unlock
 
     def _credential(self):
-        if not self.allow_unlock or not self.env_file.exists():
+        if not self.allow_unlock:
             raise DeviceError("手机已锁屏，自动解锁未配置")
-        if self.env_file.stat().st_mode & 0o077:
-            raise DeviceError(".env 权限过宽，请先 chmod 600 .env")
-        values = parse_dotenv(self.env_file.read_text())
-        keys = ("X_PHONE_PIN", "PHONE_PIN", "ANDROID_PIN", "PHONE_PASSWORD", "LOCK_SCREEN_PASSWORD", "pwd")
-        if self.unlock_method == "pattern":
-            keys = ("X_PHONE_PATTERN", "PHONE_PATTERN", "ANDROID_PATTERN", "pwd")
+        try:
+            values = read_dotenv(self.env_file)
+        except ValueError:
+            raise DeviceError('.env 权限过宽，请先 chmod 600 .env') from None
+        keys = PATTERN_KEYS if self.unlock_method == 'pattern' else PIN_KEYS
+        exported = {key: os.environ[key] for key in keys if key in os.environ}
+        if exported:
+            values = exported
         pins = {values[key] for key in keys if values.get(key)}
         if len(pins) != 1:
             raise DeviceError("本机密码配置缺失或有冲突")

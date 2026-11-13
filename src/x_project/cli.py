@@ -3,7 +3,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 from .android import DeviceError
 from .content import ContentError, utcnow
 from .pipeline import Config, Pipeline, exclusive, cancel_inflight
+from .config import RUNTIME_KEYS, TIMER_KEYS, load_runtime_environment, write_private
+from .device_setup import pair_device, connect_device
 
 
 def print_json(value):
@@ -32,19 +34,45 @@ def _quote_unit(text):
     return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def missing_dependencies(config, *, timer=False):
+    missing = []
+    if sys.version_info < (3, 11):
+        missing.append('python3.11+')
+    if sys.platform != 'linux':
+        missing.append('Linux/Landlock')
+    for name, binary in (('adb', config.adb), ('codex', config.codex)):
+        if not shutil.which(binary):
+            missing.append(name)
+    if timer and not shutil.which('systemctl'):
+        missing.append('systemd')
+    return missing
+
+
+def codex_authenticated(config):
+    allowed = set(RUNTIME_KEYS) | {'HOME'}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    try:
+        result = subprocess.run([config.codex, 'login', 'status'], capture_output=True,
+                                env=env, timeout=15)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def install_timer(config, publish):
     if publish and not config.device_id:
-        raise DeviceError("自动发布需要先在 config.toml 绑定真实 device_id")
+        raise DeviceError("自动发布需要先配置 X_DEVICE_ID（或 config.toml 的 device_id）绑定真实设备")
     user_units = Path.home()/".config"/"systemd"/"user"
     user_units.mkdir(parents=True, exist_ok=True)
     runtime_env = config.state/"runtime.env"
-    allowed = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
     lines = []
-    for key in allowed:
+    for key in sorted(TIMER_KEYS):
         value = os.environ.get(key)
-        if value is not None and "\n" not in value and "\r" not in value:
+        if value is not None:
+            if any(char in value for char in '\x00\r\n'):
+                raise ValueError(f'{key} 含有无法保存到定时任务的控制字符')
             lines.append(key+'="'+value.replace("\\", "\\\\").replace('"', '\\"')+'"')
-    runtime_env.write_text("\n".join(lines)+"\n"); runtime_env.chmod(0o600)
+    write_private(runtime_env, "\n".join(lines)+"\n")
     service = f'''# Managed by x-project
 [Unit]
 Description=Collect AI news and run one due X post
@@ -52,9 +80,8 @@ Description=Collect AI news and run one due X post
 [Service]
 Type=oneshot
 WorkingDirectory={str(config.root).replace('%', '%%')}
-Environment="PATH={Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=-{config.state}/runtime.env
-ExecStart={_quote_unit(sys.executable)} {_quote_unit(config.root/'x.py')} tick --publish
+EnvironmentFile={str(runtime_env).replace('%', '%%')}
+ExecStart={_quote_unit(sys.executable)} {_quote_unit(Path(__file__).resolve().parents[2]/'x.py')} --root {_quote_unit(config.root)} tick --publish
 TimeoutStartSec=600
 UMask=0077
 '''
@@ -76,12 +103,7 @@ WantedBy=timers.target
         if target.exists() and "# Managed by x-project" not in target.read_text():
             raise RuntimeError("已有同名 systemd 任务，未覆盖")
         target.write_text(text)
-    config_file = config.root/"config.toml"
-    text = config_file.read_text()
-    if not re.search(r"(?m)^publish_enabled\s*=", text):
-        raise ValueError("配置缺少 publish_enabled")
-    config_file.write_text(re.sub(r"(?m)^publish_enabled\s*=.*$", f"publish_enabled = {'true' if publish else 'false'}", text))
-    config_file.chmod(0o600)
+    config.set_publish_enabled(publish)
     _systemctl("daemon-reload")
     for name in ("x-project.service", "x-project.timer"):
         if _systemctl("show", name, "--property=ActiveState", "--value") == "failed":
@@ -95,6 +117,8 @@ def parser():
     p = argparse.ArgumentParser(description="AI/科技资讯整理与 Android X 发帖；默认预览")
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser('pair', help='使用本机环境配置配对手机；配对码仅通过标准输入传递')
+    sub.add_parser('connect', help='连接手机并显示设备序列号，已有绑定时核对身份')
     sub.add_parser("doctor", help="检查连接、设备绑定及本地密码是否可用，不输出密码")
     sub.add_parser("unlock-test", help="在本机测试一次自动解锁并恢复原息屏状态")
     collect = sub.add_parser("collect", help="实时检索、改写、核对来源并加入队列")
@@ -127,12 +151,12 @@ def main(argv=None):
         raise SystemExit(143)
     signal.signal(signal.SIGTERM, stop)
     try:
-        config = Config.load(args.root)
         # Stopping must remain possible while a long research/device job holds worker.lock.
         if args.command == "disable":
+            # Stopping must also work from a new shell without the exported config.
+            config = Config(Path(args.root).resolve(), '', 'adb', '', False, False, '')
             cancel_inflight(config)
-            file = config.root/"config.toml"
-            file.write_text(re.sub(r"(?m)^publish_enabled\s*=.*$", "publish_enabled = false", file.read_text()))
+            config.set_publish_enabled(False)
             try:
                 _systemctl("disable", "--now", "x-project.timer")
                 _systemctl("stop", "x-project.service")
@@ -140,6 +164,19 @@ def main(argv=None):
                 pass
             print_json({"timer": "disabled-or-not-installed", "publish_enabled": False, "inflight_cancelled": True})
             return 0
+        load_runtime_environment(args.root)
+        config = Config.load(args.root)
+        if args.command in ('pair', 'connect'):
+            with exclusive(config.state):
+                output = pair_device(config) if args.command == 'pair' else connect_device(config)
+            print_json(output)
+            return 0
+        if args.command in ('doctor', 'enable'):
+            missing = missing_dependencies(config, timer=args.command == 'enable')
+            if missing:
+                print_json({'ready': False, 'missing_dependencies': missing,
+                            'note': '请安装依赖或配置 X_ADB_PATH / X_CODEX_PATH；当前命令未操作手机'})
+                return 1
         pipeline = Pipeline(config)
         with exclusive(config.state):
             if args.command == "doctor":
@@ -150,6 +187,11 @@ def main(argv=None):
                 output = {"connected": True, "serial": config.serial, "device_bound": bool(config.device_id),
                           "account": config.account, "locked": pipeline.poster.adb.locked(), "screen_on": pipeline.poster.adb.screen_on(),
                           "unlock_method": config.unlock_method, "credential_configured": credential_configured, "unlock_blocked": (config.state/"unlock.blocked").exists()}
+                output['codex_authenticated'] = codex_authenticated(config)
+                output['ready'] = output['codex_authenticated'] and not output['unlock_blocked'] and (
+                    not output['locked'] or (config.allow_unlock and credential_configured))
+                if not output['codex_authenticated']:
+                    output['note'] = '请先执行 codex login 完成登录'
             elif args.command == "unlock-test":
                 with pipeline.poster.session():
                     output = {"unlocked": not pipeline.poster.adb.locked(), "note": "未执行任何发布操作"}
@@ -173,10 +215,6 @@ def main(argv=None):
             elif args.command == "enable":
                 pipeline.poster.adb.check()
                 output = install_timer(config, args.publish)
-            elif args.command == "disable":
-                file = config.root/"config.toml"
-                file.write_text(re.sub(r"(?m)^publish_enabled\s*=.*$", "publish_enabled = false", file.read_text()))
-                output = {"timer": "disabled", "publish_enabled": False}
             elif args.command == "unlock-reset":
                 (config.state/"unlock.blocked").unlink(missing_ok=True)
                 output = {"unlock_blocked": False}
@@ -190,7 +228,7 @@ def main(argv=None):
                 with (config.state/"events.jsonl").open("a") as log:
                     log.write(json.dumps(event, ensure_ascii=False)+"\n")
             print_json(output)
-        return 0
+        return 1 if args.command == 'doctor' and not output['ready'] else 0
     except (DeviceError, ContentError, ValueError, OSError, RuntimeError) as error:
         # All device/model errors are normalized before reaching here; no command line or PIN echoes.
         print_json({"error": str(error)})
