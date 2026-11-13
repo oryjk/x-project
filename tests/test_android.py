@@ -84,7 +84,7 @@ class AndroidTest(unittest.TestCase):
             def locked(self): return not self.scripts
             def shell(self, args, **kw):
                 self.actions.append(args)
-                return "1080x2376" if args[0]=="wm" else ""
+                return "1080x2376" if args[0]=="wm" else "0" if args==["am","get-current-user"] else ""
             def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
             def run(self,args,stdin=None,**kw): self.scripts.append(stdin)
         with tempfile.TemporaryDirectory() as d:
@@ -123,7 +123,7 @@ class AndroidTest(unittest.TestCase):
             device_id="test-bound"
             entries=0
             def locked(self): return True
-            def shell(self,args,**kw): return "1080x2376"
+            def shell(self,args,**kw): return "1080x2376" if args[0]=="wm" else "0" if args==["am","get-current-user"] else ""
             def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
             def run(self,args,stdin=None,**kw):
                 assert marker.exists()
@@ -145,7 +145,7 @@ class AndroidTest(unittest.TestCase):
         class Phone:
             device_id="bound-test"
             def locked(self): return True
-            def shell(self,args,**kw): return "1080x2376"
+            def shell(self,args,**kw): return "1080x2376" if args[0]=="wm" else "0" if args==["am","get-current-user"] else ""
             def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/oplusos_kgd_security_pattern_view" bounds="[0,0][1080,2376]"/></hierarchy>'
             def run(self,*args,**kw): raise AssertionError("must not inject credentials")
         with tempfile.TemporaryDirectory() as d:
@@ -293,7 +293,7 @@ class AndroidTest(unittest.TestCase):
             device_id="bound"
             def __init__(self):self.actions=[];self.entered=False;self.reads=0
             def locked(self):return not self.entered
-            def shell(self,args,**kw):self.actions.append(args);return "1080x2376"
+            def shell(self,args,**kw):self.actions.append(args);return "1080x2376" if args[0]=="wm" else "0" if args==["am","get-current-user"] else ""
             def dump(self):
                 self.reads+=1
                 if self.reads==1:return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/keyguard_long_press"/></hierarchy>'
@@ -322,3 +322,54 @@ class AndroidTest(unittest.TestCase):
             poster=PhonePoster(Phone(),"tester",Path(d)/".env",d)
             self.assertEqual(poster._unlock_ui().tag,"hierarchy")
             self.assertTrue(wake.is_set())
+
+    def test_pattern_fallback_requests_current_user_credential_when_normal_lockscreen_does_not_reveal_it(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="bound"
+            def __init__(self):self.actions=[];self.drawn=False;self.requested=False
+            def locked(self):return not self.drawn
+            def shell(self,args,**kw):
+                self.actions.append(args)
+                if args==["wm","size"]:return "1080x2376"
+                if args==["am","get-current-user"]:return "0"
+                if args[:3]==["cmd","lock_settings","require-strong-auth"]:self.requested=True
+                return ""
+            def dump(self):
+                if not self.requested:return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/keyguard_long_press"/></hierarchy>'
+                return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
+            def run(self,*a,**kw):self.drawn=True
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            phone=Phone();poster=PhonePoster(phone,"tester",env,root/"state",True,"pattern")
+            with patch("x_project.android.time.sleep"):poster.unlock()
+            self.assertTrue(phone.drawn)
+            self.assertIn(["cmd","lock_settings","require-strong-auth","--user","0","STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN"],phone.actions)
+            self.assertFalse(any(a[:2]==["lock_settings","set-pattern"] for a in phone.actions))
+
+    def test_pattern_requests_credential_before_waiting_for_accessibility_snapshot(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="bound"
+            def __init__(self):self.requested=False;self.drawn=False
+            def locked(self):return not self.drawn
+            def shell(self,args,**kw):
+                if args==["wm","size"]:return "1080x2376"
+                if args==["am","get-current-user"]:return "0"
+                if args[:3]==["cmd","lock_settings","require-strong-auth"]:self.requested=True
+                return ""
+            def dump(self):
+                assert self.requested, "must expose credential prompt before a slow snapshot"
+                return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
+            def run(self,*a,**kw):self.drawn=True
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            phone=Phone();poster=PhonePoster(phone,"tester",env,root/"state",True,"pattern")
+            with patch("x_project.android.time.sleep"):poster.unlock()
+            self.assertTrue(phone.drawn)

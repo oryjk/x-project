@@ -28,11 +28,11 @@ class TextParser(HTMLParser):
         if tag in ("script", "style"):
             self.hidden += 1
         if tag == "meta":
-            name = attrs.get("property", attrs.get("name", attrs.get("itemprop", ""))).lower()
+            name = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").lower()
             if name in ("description", "og:description", "twitter:description", "og:title"):
-                self.parts.append(attrs.get("content", ""))
+                self.parts.append(attrs.get("content") or "")
             if name in ("article:published_time", "datepublished", "date", "pubdate"):
-                self.dates.append(attrs.get("content", ""))
+                self.dates.append(attrs.get("content") or "")
         if tag in ("time", "relative-time") and attrs.get("datetime"):
             self.dates.append(attrs["datetime"])
 

@@ -305,6 +305,21 @@ class PhonePoster:
             stop.set()
             worker.join()
 
+    def _request_pattern_prompt(self):
+        # Request this user's existing credential, without changing lock settings.
+        # Successful pattern entry clears the temporary strong-auth requirement.
+        user = self.adb.shell(["am", "get-current-user"]).strip()
+        if not user.isdigit():
+            raise DeviceError("无法确认当前手机用户，不输入图案")
+        self.adb.shell(["cmd", "lock_settings", "require-strong-auth", "--user", user,
+                        "STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN"])
+        self.adb.shell(["input", "keyevent", "223"])
+        time.sleep(.3)
+        self.adb.shell(["input", "keyevent", "224"])
+        time.sleep(1.2)
+        self.adb.shell(["input", "keyevent", "82"])
+        time.sleep(.4)
+
     def unlock(self):
         if not self.adb.locked():
             return
@@ -318,8 +333,11 @@ class PhonePoster:
         if not size:
             raise DeviceError("无法确认手机尺寸")
         width, height = map(int, size[-1])
-        self.adb.shell(["input", "keyevent", "82"])
-        time.sleep(0.4)
+        if self.unlock_method == "pattern":
+            self._request_pattern_prompt()
+        else:
+            self.adb.shell(["input", "keyevent", "82"])
+            time.sleep(0.4)
         if not self.adb.locked():
             return
         ui = self._unlock_ui()

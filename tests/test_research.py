@@ -61,6 +61,13 @@ class ResearchTest(unittest.TestCase):
         self.assertEqual(canonical_url(d.sources[0].url),canonical_url("https://example.org/release"))
 
 
+    def test_empty_metadata_attributes_cannot_crash_source_verification(self):
+        d=draft()
+        page='<meta property="og:title" content><meta property content="ignored"><meta property="article:published_time" content="2026-11-13T01:00:00Z"><p>Release evidence from the original announcement.</p>'
+        with patch("x_project.research.fetch",return_value=page):
+            self.assertIs(SourceVerifier().verify(d),d)
+
+
 class ResearchRuntimeTest(unittest.TestCase):
     def test_custom_codex_installation_runs_inside_real_isolation(self):
         import json
