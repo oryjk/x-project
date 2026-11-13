@@ -1,0 +1,7 @@
+account = "your_x_handle"
+adb = "/home/betalpha/Android/Sdk/platform-tools/adb"
+serial = "PHONE_IP:WIRELESS_DEBUG_PORT"
+device_id = "ADB_GETPROP_RO_SERIALNO"
+allow_unlock = true
+publish_enabled = false
+persona = "AI/科技专家视角，中文简洁直说。关注模型能力、开源、工程落地、成本和局限；事实与个人判断分开，不夸大、不冒充亲测。"
