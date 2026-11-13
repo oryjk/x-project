@@ -78,6 +78,41 @@ def publication_receipt(xml):
     return False
 
 
+def profile_post(xml, body, account, max_age=None):
+    """Match one actual post container, never unrelated feed/profile text.
+
+    A missing max_age is used only for the duplicate preflight. Receipt checking
+    requires a relative timestamp no older than the current submission window.
+    """
+    root = _root(xml)
+    parents = {child: parent for parent in root.iter() for child in parent}
+    handle = "@"+account.lstrip("@").casefold()
+    for node in _nodes(root):
+        if not _same_text(node.get("text", ""), body):
+            continue
+        container = parents.get(node)
+        if container is None:
+            continue
+        nodes = list(container.iter("node"))
+        handles = [n.get("text", "").casefold() for n in nodes
+                   if re.fullmatch(r"@[A-Za-z0-9_]+", n.get("text", ""))]
+        options = [n for n in nodes if n.get("content-desc", "") in ("发帖选项", "Post options", "Tweet options")]
+        if handles != [handle] or len(options) != 1:
+            continue
+        if max_age is None:
+            return True
+        for n in nodes:
+            text = n.get("text", "").strip()
+            if text in ("· 刚刚", "· now", "· Now"):
+                return True
+            match = re.fullmatch(r"·\s*(\d+)\s*(秒|分钟|s|m)", text)
+            if match:
+                age = int(match[1]) * (60 if match[2] in ("分钟", "m") else 1)
+                if age <= min(max_age, 120):
+                    return True
+    return False
+
+
 def inspect_composer(xml, expected_text, expected_account):
     root = _root(xml)
     nodes = _nodes(root)
@@ -186,7 +221,10 @@ class Adb:
 
 
 class PhonePoster:
-    def __init__(self, adb, account, env_file, state_dir, allow_unlock=False):
+    def __init__(self, adb, account, env_file, state_dir, allow_unlock=False, unlock_method="pin"):
+        if unlock_method not in ("pin", "pattern"):
+            raise DeviceError("unlock_method 必须是 pin 或 pattern")
+        self.unlock_method = unlock_method
         self.adb = adb
         self.account = account.lstrip("@")
         self.env_file = Path(env_file)
@@ -194,41 +232,94 @@ class PhonePoster:
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.allow_unlock = allow_unlock
 
-    def _pin(self):
+    def _credential(self):
         if not self.allow_unlock or not self.env_file.exists():
             raise DeviceError("手机已锁屏，自动解锁未配置")
         if self.env_file.stat().st_mode & 0o077:
             raise DeviceError(".env 权限过宽，请先 chmod 600 .env")
         values = parse_dotenv(self.env_file.read_text())
         keys = ("X_PHONE_PIN", "PHONE_PIN", "ANDROID_PIN", "PHONE_PASSWORD", "LOCK_SCREEN_PASSWORD", "pwd")
+        if self.unlock_method == "pattern":
+            keys = ("X_PHONE_PATTERN", "PHONE_PATTERN", "ANDROID_PATTERN", "pwd")
         pins = {values[key] for key in keys if values.get(key)}
         if len(pins) != 1:
             raise DeviceError("本机密码配置缺失或有冲突")
         pin = pins.pop()
-        if not re.fullmatch(r"[0-9]{4,16}", pin):
+        if self.unlock_method == "pattern":
+            if not re.fullmatch(r"[1-9]{4,9}", pin) or len(set(pin)) != len(pin):
+                raise DeviceError("图案须为 4–9 个不重复的九宫格点位，编号为 1–9")
+        elif not re.fullmatch(r"[0-9]{4,16}", pin):
             raise DeviceError("当前仅支持 4–16 位数字 PIN；其他锁屏方式请手动解锁")
         return pin
+
+    def _pin(self):
+        return self._credential()
+
+    def _pattern_bounds(self, ui):
+        nodes = [n for n in ui.iter("node") if n.get("package") == "com.android.systemui"
+                 and n.get("resource-id", "").split("/")[-1] in ("colorLockPatternView", "lockPatternView")]
+        if len(nodes) != 1:
+            return None
+        match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", nodes[0].get("bounds", ""))
+        return tuple(map(int, match.groups())) if match else None
+
+    def _draw_pattern(self, pattern, bounds):
+        x1, y1, x2, y2 = bounds
+        if x2 <= x1 or y2 <= y1:
+            raise DeviceError("图案区域无效，停止输入")
+        points = []
+        for digit in pattern:
+            row, col = divmod(int(digit)-1, 3)
+            points.append((round(x1+(col+.5)*(x2-x1)/3), round(y1+(row+.5)*(y2-y1)/3)))
+        # One pointer contact, interpolated through each segment. No secret in host argv.
+        start_x, start_y = points[0]
+        end_x, end_y = points[-1]
+        commands = ["set -e", f"trap 'input touchscreen motionevent UP {end_x} {end_y}' EXIT",
+                    f"input touchscreen motionevent DOWN {start_x} {start_y}"]
+        for (ax, ay), (bx, by) in zip(points, points[1:]):
+            steps = max(1, (max(abs(bx-ax), abs(by-ay))+59)//60)
+            for step in range(1, steps+1):
+                x = round(ax+(bx-ax)*step/steps); y = round(ay+(by-ay)*step/steps)
+                commands.append(f"input touchscreen motionevent MOVE {x} {y}")
+        self.adb.run(["shell", "sh", "-s"], timeout=45, stdin="\n".join(commands)+"\n")
 
     def unlock(self):
         if not self.adb.locked():
             return
         if not getattr(self.adb, "device_id", ""):
-            raise DeviceError("自动输入 PIN 前必须绑定物理设备")
+            raise DeviceError("自动解锁前必须绑定物理设备")
         marker = self.state_dir / "unlock.blocked"
         if marker.exists():
             raise DeviceError("上次自动解锁未成功，须核对后运行 unlock-reset")
-        pin = self._pin()
+        pin = self._credential()
         size = re.findall(r"(\d+)x(\d+)", self.adb.shell(["wm", "size"]))
         if not size:
             raise DeviceError("无法确认手机尺寸")
         width, height = map(int, size[-1])
         self.adb.shell(["input", "keyevent", "82"])
         time.sleep(0.4)
-        self.adb.shell(["input", "swipe", str(width // 2), str(height * 85 // 100), str(width // 2), str(height * 25 // 100), "400"])
-        time.sleep(0.5)
         if not self.adb.locked():
             return
         ui = _root(self.adb.dump())
+        if self.unlock_method == "pattern":
+            bounds = self._pattern_bounds(ui)
+            if bounds is None:
+                self.adb.shell(["input", "swipe", str(width//2), str(height-8), str(width//2), str(height//4), "400"])
+                time.sleep(.5)
+                if not self.adb.locked():
+                    return
+                bounds = self._pattern_bounds(_root(self.adb.dump()))
+            if bounds is None or not (0 <= bounds[0] < bounds[2] <= width and 0 <= bounds[1] < bounds[3] <= height):
+                raise DeviceError("未确认系统图案区域，不输入图案")
+            marker.write_text("核对手机后手动运行 unlock-reset。\n")
+            marker.chmod(0o600)
+            self._draw_pattern(pin, bounds)
+            for _ in range(8):
+                time.sleep(.4)
+                if not self.adb.locked():
+                    marker.unlink(missing_ok=True)
+                    return
+            raise DeviceError("自动解锁未成功，已停止后续尝试")
         fields = [n for n in ui.iter("node") if n.get("password") == "true" and "EditText" in n.get("class", "")]
         if len(fields) != 1:
             system_ui = self.adb.shell(["dumpsys", "activity", "service", "com.android.systemui/.SystemUIService"], timeout=25)
@@ -286,10 +377,18 @@ class PhonePoster:
         return inspect_composer(self.adb.dump(), text, self.account)
 
     def send(self, text, body, before_submit):
+        # Preserve unrelated drafts before navigating to the account profile.
+        existing = self.adb.dump()
+        if any(n.get("class") == "android.widget.EditText" for n in _nodes(_root(existing))):
+            inspect_composer(existing, text, self.account)
+        self._open_profile()
+        if profile_post(self.adb.dump(), body, self.account):
+            raise DeviceError("账号主页已有相同正文，停止提交以避免重复")
         self.prepare(text)
         # Refresh semantics immediately before the only irreversible tap.
         x, y = inspect_composer(self.adb.dump(), text, self.account)
         before_submit()
+        started = time.monotonic()
         self.adb.shell(["input", "tap", str(x), str(y)])
         for _ in range(3):
             time.sleep(0.8)
@@ -297,5 +396,14 @@ class PhonePoster:
             nodes = _nodes(_root(xml))
             if not any(n.get("class") == "android.widget.EditText" for n in nodes) and publication_receipt(xml):
                 return "sent", "X 显示明确发布成功回执"
-        # Feed/profile text cannot prove a new post belongs to this submission.
+        self._open_profile()
+        if profile_post(self.adb.dump(), body, self.account, time.monotonic()-started+5):
+            return "sent", "主页同一帖子核对作者、完整正文及本次提交时间；提交前未出现该正文"
         return "unknown", "已点击发布，但无法确认回执；核对 X 后运行 resolve，禁止自动重发"
+
+    def _open_profile(self):
+        result = self.adb.shell(["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d",
+                                 "https://x.com/"+self.account, "-p", PACKAGE])
+        if "Error:" in result or "Exception" in result:
+            raise DeviceError("无法打开绑定账号主页")
+        time.sleep(2)

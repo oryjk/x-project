@@ -39,6 +39,7 @@ class Config:
     publish_enabled: bool
     persona: str
     device_id: str = ""
+    unlock_method: str = "pin"
 
     @classmethod
     def load(cls, root):
@@ -74,7 +75,7 @@ class Pipeline:
         self.researcher = researcher or CodexResearcher(audit_dir=config.state)
         self.verifier = verifier or SourceVerifier()
         self.poster = poster or PhonePoster(Adb(config.adb, config.serial, config.device_id), config.account,
-                                          config.root/".env", config.state, config.allow_unlock)
+                                          config.root/".env", config.state, config.allow_unlock, config.unlock_method)
 
     def collect(self, count=3):
         history = [{"topic": row["topic"], "sources": json.loads(row["draft"])["sources"]} for row in self.store.rows(90)]

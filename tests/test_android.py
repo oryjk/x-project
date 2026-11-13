@@ -72,3 +72,148 @@ class AndroidTest(unittest.TestCase):
         adb = Adb("adb", "phone", "")
         with patch.object(adb, "run", return_value="device"):
             with self.assertRaises(DeviceError): adb.check()
+
+    def test_pattern_uses_visible_grid_and_one_continuous_touch(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id = "test-bound"
+            def __init__(self): self.scripts=[]; self.actions=[]
+            def locked(self): return not self.scripts
+            def shell(self, args, **kw):
+                self.actions.append(args)
+                return "1080x2376" if args[0]=="wm" else ""
+            def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
+            def run(self,args,stdin=None,**kw): self.scripts.append(stdin)
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            phone=Phone(); poster=PhonePoster(phone,"tester",env,root/"state",True,unlock_method="pattern")
+            with patch("x_project.android.time.sleep"): poster.unlock()
+            script=phone.scripts[0]
+            self.assertEqual(script.count("motionevent DOWN"),1)
+            self.assertEqual(script.count("motionevent UP"),1)
+            self.assertIn("DOWN 228 1226",script)
+            self.assertIn("UP 852 1786",script)
+            self.assertGreater(script.count("motionevent MOVE"),4)
+            self.assertFalse(any(a[:2]==["input","swipe"] for a in phone.actions))
+            self.assertFalse((root/"state/unlock.blocked").exists())
+
+    def test_pattern_rejects_invalid_paths_and_unknown_unlock_methods(self):
+        import tempfile
+        from pathlib import Path
+        from x_project.android import PhonePoster
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env"
+            for value in ("123", "1230", "11234", "abcdefgh"):
+                env.write_text("pwd="+value);env.chmod(0o600)
+                poster=PhonePoster(None,"tester",env,root,True,unlock_method="pattern")
+                with self.assertRaises(DeviceError) as error: poster._credential()
+                self.assertNotIn(value,str(error.exception))
+            with self.assertRaises(DeviceError):
+                PhonePoster(None,"tester",env,root,True,unlock_method="guess")
+
+    def test_failed_pattern_is_latched_before_input_without_retries(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="test-bound"
+            entries=0
+            def locked(self): return True
+            def shell(self,args,**kw): return "1080x2376"
+            def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/colorLockPatternView" bounds="[72,1086][1008,1926]"/></hierarchy>'
+            def run(self,args,stdin=None,**kw):
+                assert marker.exists()
+                self.entries+=1
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            marker=root/"state/unlock.blocked";phone=Phone()
+            poster=PhonePoster(phone,"tester",env,root/"state",True,unlock_method="pattern")
+            with patch("x_project.android.time.sleep"):
+                for _ in range(2):
+                    with self.assertRaises(DeviceError): poster.unlock()
+            self.assertEqual(phone.entries,1)
+
+    def test_pattern_does_not_use_a_full_screen_parent_as_grid(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="bound-test"
+            def locked(self): return True
+            def shell(self,args,**kw): return "1080x2376"
+            def dump(self): return '<hierarchy><node package="com.android.systemui" resource-id="com.android.systemui:id/oplusos_kgd_security_pattern_view" bounds="[0,0][1080,2376]"/></hierarchy>'
+            def run(self,*args,**kw): raise AssertionError("must not inject credentials")
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);env=root/".env";env.write_text("pwd=12589");env.chmod(0o600)
+            poster=PhonePoster(Phone(),"tester",env,root/"state",True,"pattern")
+            with patch("x_project.android.time.sleep"):
+                with self.assertRaises(DeviceError):poster.unlock()
+            self.assertFalse((root/"state/unlock.blocked").exists())
+
+    def test_session_restores_sleep_and_timeout_after_unlock_failure(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        class Phone:
+            device_id="bound-test"
+            def __init__(self):self.actions=[]
+            def check(self):pass
+            def screen_on(self):return False
+            def shell(self,args,**kw):self.actions.append(args);return "30000"
+        with tempfile.TemporaryDirectory() as d:
+            phone=Phone();poster=PhonePoster(phone,"tester",Path(d)/".env",d,True,"pattern")
+            with patch.object(poster,"unlock",side_effect=DeviceError("failed")), patch("x_project.android.time.sleep"):
+                with self.assertRaises(DeviceError):
+                    with poster.session():self.fail("must not enter session")
+            self.assertIn(["settings","put","system","screen_off_timeout","30000"],phone.actions)
+            self.assertEqual(phone.actions[-1],["input","keyevent","223"])
+
+    def test_profile_receipt_requires_same_post_author_body_and_fresh_time(self):
+        from x_project.android import profile_post
+        def tree(author="tester",age="· 12秒",text="完整正文"):
+            return f'<hierarchy><node package="com.twitter.android"><node text="@tester"/><node><node text="@{author}"/><node text="{age}"/><node content-desc="发帖选项"/><node package="com.twitter.android" text="{text}"/></node></node></hierarchy>'
+        self.assertTrue(profile_post(tree(),"完整正文","tester",20))
+        self.assertFalse(profile_post(tree(author="other"),"完整正文","tester",20))
+        self.assertFalse(profile_post(tree(age="· 1小时"),"完整正文","tester",20))
+        self.assertFalse(profile_post(tree(age="· 50秒"),"完整正文","tester",20))
+        self.assertFalse(profile_post(tree(text="截断正文"),"完整正文","tester",20))
+        self.assertFalse(profile_post(tree().replace('<node text="@tester"/><node text="· 12秒"/>','<node><node text="@other"/></node><node text="· 12秒"/>'),"完整正文","tester",20))
+
+    def test_send_uses_preflight_and_recent_profile_when_toast_was_missed(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from x_project.android import PhonePoster
+        empty='<hierarchy/>'
+        recent='<hierarchy><node package="com.twitter.android"><node text="@tester"/><node text="· 1秒"/><node content-desc="发帖选项"/><node package="com.twitter.android" text="完整正文"/></node></hierarchy>'
+        class Phone:
+            def __init__(self):
+                self.ui=iter([empty,empty,xml(body="完整正文"),xml(body="完整正文"),empty,empty,empty,recent]);self.actions=[]
+            def dump(self):return next(self.ui)
+            def shell(self,args):self.actions.append(args);return ""
+        with tempfile.TemporaryDirectory() as d:
+            phone=Phone();poster=PhonePoster(phone,"tester",Path(d)/".env",d)
+            def before():phone.actions.append(["before-submit"])
+            with patch("x_project.android.time.sleep"):
+                status,_=poster.send("完整正文","完整正文",before)
+            self.assertEqual(status,"sent")
+            taps=[a for a in phone.actions if a[:2]==["input","tap"]]
+            self.assertEqual(len(taps),1)
+            self.assertLess(phone.actions.index(["before-submit"]),phone.actions.index(taps[0]))
+
+    def test_send_preserves_an_unrelated_user_draft(self):
+        import tempfile
+        from pathlib import Path
+        from x_project.android import PhonePoster
+        class Phone:
+            def dump(self):return xml(body="用户正在写的草稿")
+            def shell(self,args):raise AssertionError("must not navigate or publish")
+        with tempfile.TemporaryDirectory() as d:
+            poster=PhonePoster(Phone(),"tester",Path(d)/".env",d)
+            with self.assertRaises(DeviceError):poster.send("正式正文","正式正文",lambda:None)

@@ -110,7 +110,7 @@ def parser():
     enable = sub.add_parser("enable", help="安装并启用用户级定时器；--publish 开启正式自动发布")
     enable.add_argument("--publish", action="store_true")
     sub.add_parser("disable", help="停止定时器并关闭自动发布")
-    reset = sub.add_parser("unlock-reset", help="核对本机 PIN 后，解除一次失败造成的保护锁定")
+    reset = sub.add_parser("unlock-reset", help="核对本机解锁凭据后，解除一次失败造成的保护锁定")
     resolve = sub.add_parser("resolve", help="核对 X 实际结果后处理 unknown，绝不自动重发")
     resolve.add_argument("--id", type=int, required=True)
     result = resolve.add_mutually_exclusive_group(required=True)
@@ -143,11 +143,11 @@ def main(argv=None):
             if args.command == "doctor":
                 pipeline.poster.adb.check()
                 try:
-                    pipeline.poster._pin(); pin_configured = True
-                except DeviceError: pin_configured = False
+                    pipeline.poster._credential(); credential_configured = True
+                except DeviceError: credential_configured = False
                 output = {"connected": True, "serial": config.serial, "device_bound": bool(config.device_id),
                           "account": config.account, "locked": pipeline.poster.adb.locked(), "screen_on": pipeline.poster.adb.screen_on(),
-                          "pin_configured": pin_configured, "unlock_blocked": (config.state/"unlock.blocked").exists()}
+                          "unlock_method": config.unlock_method, "credential_configured": credential_configured, "unlock_blocked": (config.state/"unlock.blocked").exists()}
             elif args.command == "unlock-test":
                 with pipeline.poster.session():
                     output = {"unlocked": not pipeline.poster.adb.locked(), "note": "未执行任何发布操作"}
