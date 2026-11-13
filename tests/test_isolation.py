@@ -15,7 +15,12 @@ class IsolationTest(unittest.TestCase):
             work = root/"work"; work.mkdir(); (work/"evidence.txt").write_text("public source")
             wrapper = Path(__file__).resolve().parents[1]/"src"/"x_project"/"isolation.py"
             program = "from pathlib import Path; import sys; print(Path(sys.argv[1]).read_text());\ntry: Path(sys.argv[2]).read_text()\nexcept PermissionError: print('SECRET_BLOCKED')\nelse: raise SystemExit('READ_LEAK')"
-            run = subprocess.run([sys.executable, str(wrapper), "--read-root", str(work), "--", sys.executable, "-c", program, str(work/"evidence.txt"), str(secret)], capture_output=True, text=True)
+            # A uv-managed interpreter lives outside the system read roots. Use
+            # its base executable so the child needs no project venv files.
+            interpreter = str(Path(sys.executable).resolve())
+            run = subprocess.run([sys.executable, str(wrapper), "--read-root", str(work),
+                                  "--read-root", sys.base_prefix, "--", interpreter, "-c", program,
+                                  str(work/"evidence.txt"), str(secret)], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("public source", run.stdout)
             self.assertIn("SECRET_BLOCKED", run.stdout)
